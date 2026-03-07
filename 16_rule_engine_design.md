@@ -1,0 +1,1632 @@
+# ルールエンジン設計書
+
+Phase 1（ルールエンジン実装）の設計図。
+既存仕様書（`06_turn_flow.md`, `07_data_model.md`, `15_damage_formula.md` 等）の処理ルールを統合し、
+C# 実装の全体像を定義する。
+
+---
+
+## 1. アーキテクチャ概要
+
+### 設計原則
+
+| 原則 | 内容 |
+|---|---|
+| **純粋関数に近い形** | 各処理は GameState を受け取り、変更後の GameState を返す。副作用はイベント発行で表現する |
+| **イベント駆動** | すべてのゲーム内変化は GameEvent として記録・処理される（`06_turn_flow.md`） |
+| **決定的処理** | rngSeed ベースの乱数により、同一入力から同一結果を再現可能（リプレイ対応） |
+| **テスト容易性** | UI 非依存。インターフェース経由で各モジュールを差し替え・モック可能 |
+
+### 全体構成図
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                     GameManager                         │
+│  （ゲーム全体の進行制御・マッチ開始〜終了）              │
+└──────────────┬──────────────────────────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────────────────────────┐
+│                    TurnProcessor                        │
+│  （フェイズ遷移・各フェイズ処理のオーケストレーション）  │
+│                                                         │
+│  ┌──────────┐ ┌──────────────┐ ┌─────────────────────┐  │
+│  │DeckMgr   │ │ActionResolver│ │StatusEffectProcessor│  │
+│  │(ドロー/  │ │(行動ソート/  │ │(状態異常/バフの     │  │
+│  │ シャッフル│ │ 不発判定/    │ │ 付与/解除/期限切れ) │  │
+│  │ /ゾーン)  │ │ 順次解決)    │ │                     │  │
+│  └──────────┘ └──────┬───────┘ └─────────────────────┘  │
+│                      │                                   │
+│       ┌──────────────┼──────────────┐                   │
+│       ▼              ▼              ▼                   │
+│  ┌──────────┐ ┌──────────────┐ ┌───────────┐           │
+│  │DamageCal │ │StatCalculator│ │TriggerSys │           │
+│  │(ダメージ │ │(5段階パイプ  │ │(トリガー  │           │
+│  │ 計算)    │ │ ライン)      │ │ 判定/割込)│           │
+│  └──────────┘ └──────────────┘ └───────────┘           │
+│                                                         │
+│  ┌──────────┐ ┌──────────────┐ ┌───────────┐           │
+│  │SummonMgr │ │BurstManager  │ │RngProvider│           │
+│  │(生成/消滅│ │(ゲージ管理/  │ │(決定的   │           │
+│  │ /上書き) │ │ バースト状態)│ │ 乱数生成)│           │
+│  └──────────┘ └──────────────┘ └───────────┘           │
+└─────────────────────────────────────────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────────────────────────┐
+│                     EventQueue                          │
+│  （イベント駆動の中核。FIFO キュー）                    │
+└─────────────────────────────────────────────────────────┘
+```
+
+### モジュール責務一覧
+
+| モジュール | 責務 |
+|---|---|
+| **GameManager** | マッチの開始・終了制御、GameState 初期化、勝敗判定 |
+| **TurnProcessor** | フェイズ遷移、各フェイズ処理の呼び出し |
+| **EventQueue** | イベントの蓄積と FIFO 順次処理 |
+| **StatCalculator** | ステータス修正パイプライン（5段階） |
+| **DamageCalculator** | ダメージ計算（物理/魔法/真ダメージ） |
+| **ActionResolver** | 行動ソート・不発判定・順次解決 |
+| **TriggerSystem** | トリガー条件判定・割り込み処理 |
+| **SummonManager** | 召喚の生成/消滅/上書き/バースト変化 |
+| **BurstManager** | バーストゲージ管理・バースト状態の適用/解除 |
+| **DeckManager** | デッキ操作（ドロー/再構築/ゾーン移動） |
+| **StatusEffectProcessor** | 状態異常/バフの付与/解除/期限切れ |
+| **RngProvider** | 決定的乱数生成（seedベース） |
+
+### 依存関係
+
+```
+GameManager → TurnProcessor → ActionResolver → DamageCalculator
+                                             → StatCalculator
+                                             → TriggerSystem
+                            → DeckManager
+                            → StatusEffectProcessor
+                            → SummonManager → StatCalculator
+                            → BurstManager → SummonManager
+                                           → StatCalculator
+全モジュール → EventQueue（イベント発行）
+全モジュール → RngProvider（乱数が必要な場合）
+```
+
+---
+
+## 2. ゲームループとステートマシン
+
+### GameState の方針
+
+GameState は **ミュータブル（in-place 変更）** 方式を採用する。
+ただし、以下の制約を設ける。
+
+- 各処理メソッドは GameState を引数に受け取り、変更後の同一 GameState を返す
+- 変更前の状態が必要な場合（リプレイ差分、ロールバック等）は、呼び出し元で明示的にスナップショットを取る
+- テスト時はディープコピーで状態の前後比較が可能
+
+### フェイズ遷移図
+
+```
+MatchSetup → TurnStart → Draw → Preparation → Battle → TurnEnd
+                 ▲                                         │
+                 │                                         │
+                 └─── (次ターンへ) ◄────────────────────────┘
+                                                           │
+                                              (勝敗確定) → GameEnd
+```
+
+### 各フェイズの処理責務
+
+#### MatchSetup（対戦開始時）
+
+```
+1. RegulationDefinition を読み込み
+2. 両チームの編成（キャラ/デッキ/ユニーク/サポート）をロード
+3. セット効果（構築時パッシブ）を適用
+   - キャラデッキ内カードの setEffects → キャラへ適用
+   - サポートカードの setEffects → チームへ適用
+4. チームデッキを作成（3キャラのキャラデッキを合体）
+5. デッキをシャッフル（rngSeed 使用）
+6. 初期手札ドロー（5枚）
+7. セット効果による追加ドロー（初期手札5枚の後に処理）
+8. initiativeTeamId を rngSeed から決定（以降固定）
+9. 初期 Burst = 0（セット効果で初期値がある場合はそれを適用）
+10. 初期エレメント = 各色 0（同上）
+11. 初期 AP = apStart（標準: 3）
+    - unlockedMaxAP = apStart
+```
+
+**イベント**: `MatchStarted`
+
+#### TurnStart（ターン開始フェイズ）
+
+```
+1. turn カウンタをインクリメント
+2. 「ターン開始時」トリガー解決（アイテム/パッシブ/状態/フィールド効果）
+3. 召喚ユニットの hasActedThisTurn をリセット（false）
+4. AP 解放: unlockedMaxAP += 1（ただし apCap まで）
+5. AP 回復: ap += apRegen（ただし unlockedMaxAP まで）
+   ※ 1ターン目開始時は AP 解放/回復を行わない（初期値のまま）
+```
+
+**イベント**: `TurnStarted`, `PhaseChanged(TurnStart)`
+
+#### Draw（ドローフェイズ）
+
+```
+1. ドロー枚数 = ダウンしていないキャラの数（最大3枚）
+2. デッキ枚数 ≥ ドロー枚数 → 通常ドロー
+3. デッキ枚数 < ドロー枚数 →
+   a. 残りデッキから引けるだけ引く
+   b. graveyard のカードをすべてデッキに戻す
+   c. Fisher-Yates シャッフル（rngSeed）
+   d. DeckReshuffledFromTrash イベント発行
+   e. 不足分をドロー
+4. 「ドロー時」トリガー解決
+```
+
+**イベント**: `PhaseChanged(Draw)`, `CardDrawn`, `DeckReshuffledFromTrash`（必要時）
+
+#### Preparation（準備フェイズ / 30秒）
+
+```
+1. 両プレイヤーに行動予約の入力を受付
+2. 各予約の妥当性チェック（推奨）:
+   - AP 合計がキャラの currentAP 以下か
+   - クールダウン中でないか
+   - 対象が存在するか
+3. バースト状態の予約も受付（Burst 1本消費予約）
+4. decisionSubmittedAtMs を記録
+5. 制限時間（30秒）終了時、未確定の場合はパス扱い
+6. 決定速度ボーナスの算出:
+   - 10秒以内: +70pt
+   - 20秒以内: +50pt
+   - 30秒以内: +30pt
+   - 時間切れ: +0pt
+```
+
+**イベント**: `PhaseChanged(Preparation)`, `ActionReserved`
+
+#### Battle（バトルフェイズ）
+
+```
+1. 決定速度ボーナスを burstPoints に加算
+2. バースト状態の予約があれば適用（行動解決の前に）
+   - ステータス上昇（倍率式）
+   - AP +2 回復
+   - unlockedMaxAP +1 解放
+   - 既存召喚のバースト版への変化
+   - ユニークカードの強化版への変化
+3. 全予約行動をソート（タイブレークチェーン）
+4. 各行動を順次解決:
+   a. 不発チェック（AP不足/エレメント不足/対象不在/CD中）
+   b. 不発なら ActionResolved(fizzled) を発行しスキップ
+   c. コスト支払い（AP 消費、エレメント消費）
+   d. 効果解決
+   e. カードをトラッシュへ（hand → graveyard）
+   f. トリガー判定（予約済みトリガー付きカードの条件チェック）
+      → 条件成立なら割り込みで早期発動
+   g. Burst 増加（行動チャージ: +30pt）
+   h. 自動発動チェック（アイテム条件）
+   i. ステータス再計算（バフ/デバフ変動時）
+   j. ActionResolved(executed) イベント発行
+5. 全行動解決後に勝敗判定
+```
+
+**イベント**: `PhaseChanged(Battle)`, `ActionResolved`, `CardPlayed`, `DamageDealt`, `Healed`, `StatusApplied`, 他多数
+
+#### TurnEnd（ターン終了フェイズ）
+
+```
+1. 現在存在する全永続効果を収集:
+   - 召喚オブジェクト/ユニット
+   - バースト状態
+   - フィールド効果
+   - 状態異常/バフ
+   - アイテム（持続ターン減少のみ）
+   - ユニークCD / サポートCD
+2. createdSeq 昇順にソート
+3. 各効果について:
+   a. 持続カウント（remainingTurns 等）を 1 減少
+   b. 0 になった場合は消滅/期限切れ処理:
+      - 召喚: SummonObjectExpired / SummonUnitExpired
+      - バースト状態: 解除（AP上限/召喚/ユニークを元に戻す）
+      - フィールド効果: FieldEffectExpired
+      - 状態異常: StatusExpired
+      - CD: cooldownRemainingTurns-- のみ（0で使用可能に戻る）
+   c. 消滅で誘発トリガーが発生した場合、イベントキューへ積む
+4. ターン終了フェイズ中に新たに生成された永続効果は
+   そのターンの処理リストには含めない（次ターンから）
+5. 手札上限チェックなし
+6. maxTurns に到達した場合 → GameEnd（タイブレーク判定）
+```
+
+**イベント**: `PhaseChanged(TurnEnd)`, `TurnEnded`, 各種 Expired イベント
+
+---
+
+## 3. イベントシステム
+
+### EventQueue の構造
+
+```
+EventQueue（FIFO キュー）
+├── Enqueue(event): イベントを末尾に追加
+├── Dequeue(): 先頭のイベントを取り出して処理
+├── ProcessAll(): キューが空になるまで順次処理
+└── Count: 現在キュー内のイベント数
+```
+
+- キューは **FIFO**（先入先出）で処理する
+- 処理中に追加されたイベントは **末尾** に積まれる
+- 1つのイベント処理が完了してから次のイベントを処理する
+
+### イベントの発火 → 収集 → 解決フロー
+
+```
+アクション実行
+    │
+    ▼
+イベント生成（例: DamageDealt）
+    │
+    ▼
+EventQueue に Enqueue
+    │
+    ▼
+イベント処理開始（Dequeue）
+    │
+    ▼
+トリガー条件スキャン
+├── アイテムのトリガー条件をチェック
+├── パッシブの常時参照
+├── 状態異常の誘発条件をチェック
+├── フィールド効果のトリガーをチェック
+└── 予約済みカードのトリガー条件をチェック
+    │
+    ▼
+条件成立したトリガーの追加イベントを Enqueue
+    │
+    ▼
+次のイベントを Dequeue（繰り返し）
+```
+
+### トリガー判定の仕組み
+
+各イベント処理後に、以下の順序でトリガー条件をスキャンする。
+
+1. **アイテムのトリガー**: キャラにセットされたアイテムの `triggers` をチェック
+2. **パッシブの常時参照**: 解放済みパッシブの参照条件をチェック
+3. **状態異常/バフの誘発**: `triggers` フィールドを持つ StatusEffect をチェック
+4. **フィールド効果の誘発**: FieldEffectInstance の `triggers` をチェック
+5. **予約済みカードのトリガー**: バトルフェイズ中、予約済みカードの `trigger` 条件をチェック
+
+### 無限ループ対策
+
+- 同一フェイズ内で、**同一エンティティから発生する誘発回数は上限 10 回**
+- 上限に達した場合、それ以上の誘発は無視する
+- カウンタはフェイズ開始時にリセットされる
+
+### 同時誘発の解決順
+
+1. **イニシアチブ側が先** に解決順を決める
+2. 同一プレイヤー内の複数誘発は、**所有者が解決順を選択** する
+3. 最終タイブレークは `initiativeTeamId` を使用
+
+---
+
+## 4. 行動解決パイプライン（ActionResolver）
+
+### ソートキー（タイブレークチェーン）
+
+上位の基準で差がつけば、以降は参照しない。
+
+| 優先度 | キー | 順序 | 説明 |
+|---|---|---|---|
+| 1 | `priority` | **降順** | カード優先度が高い行動を先に解決 |
+| 2 | `spd` | **降順** | 行動主体（キャラ/召喚ユニット）の速度 |
+| 3 | `decisionSubmittedAtMs` | **昇順** | 準備フェイズの確定ボタンが早いチームが先 |
+| 4 | `initiativeTeamId` | — | 上記まで同値ならイニシアチブ側が先 |
+| 5 | `createdSeq` | **昇順** | 同一チーム内で全て同値ならエンティティ生成連番 |
+
+- 時間切れ（未確定）の行動は、同 priority/spd 帯の **末尾** に配置
+- 召喚ユニットの行動もキャラと同じソートに参加（0コストスキルの priority と召喚ユニットの spd を使用）
+- 試合中に乱数を使った最終タイブレークは行わない
+
+### 不発チェック（FizzleCheck）
+
+行動の **発動宣言前** に以下を順にチェックする。
+
+| チェック | 不発理由（FizzleReason） | 条件 |
+|---|---|---|
+| AP 不足 | `insufficientAP` | `currentAP < cost`（軽減後） |
+| エレメント不足 | `insufficientElement` | 必要エレメント数を満たさない |
+| 対象不在 | `invalidTarget` | 対象キャラがダウン済み or 対象不在 |
+| クールダウン中 | `cooldownActive` | ユニーク/サポートの CD > 0 |
+
+- 不発カードは **手札に残る**（相手に公開されない）
+- AP・エレメントは消費しない
+- コスト軽減の下限: `max(1, originalCost - reduction)`（0コストカードは除く）
+
+### 解決フロー
+
+```
+1. 全予約行動を収集
+2. ソートキーで並び替え
+3. バースト状態の適用（バトルフェイズ開始時、行動解決の前）
+4. 各行動を順次解決:
+   ┌─────────────────────────────────────────┐
+   │ 4a. 不発チェック                        │
+   │     → 不発なら ActionResolved(fizzled)   │
+   │       を発行してスキップ                 │
+   │ 4b. コスト支払い                        │
+   │     - AP 消費                            │
+   │     - エレメント消費（elementCost）       │
+   │ 4c. エレメント獲得（有色カード→その色+1）│
+   │ 4d. 効果解決                            │
+   │     - DamageCalculator / StatCalculator  │
+   │       等を呼び出し                       │
+   │ 4e. カード処理                          │
+   │     - hand → graveyard                   │
+   │ 4f. ActionResolved(executed) 発行        │
+   │ 4g. トリガー割り込み判定                │
+   │     → TriggerSystem で予約済みトリガー  │
+   │       付きカードの条件チェック            │
+   │     → 成立なら割り込みで即座に解決      │
+   │ 4h. Burst 増加（行動チャージ: +30pt）    │
+   │ 4i. 自動発動チェック（アイテム条件）     │
+   │ 4j. ステータス再計算（変動があれば）     │
+   └─────────────────────────────────────────┘
+5. 全行動解決後に勝敗判定
+```
+
+### ActionResolved イベントの生成
+
+すべての行動（不発含む）について `ActionResolved` イベントを生成する。
+
+記録内容:
+- `actionId`, `actorType`, `actorId`, `cardId`
+- `resolvedAs`: `executed | fizzled`
+- `fizzleReason`: 不発理由（不発時のみ）
+- `activationMode`: `normal | interrupt`
+- `apBefore`, `apCostApplied`, `apAfter`
+- `sortKey`: 5項目のソートキー
+- `tieBreakLevelUsed`: どこで順序が確定したか
+
+---
+
+## 5. ステータス修正パイプライン（StatCalculator）
+
+### 5段階パイプライン
+
+```
+base → additive → multiplicative → clamp → finalFloor
+```
+
+| 段階 | 内容 | 例 |
+|---|---|---|
+| **1. base** | キャラ/召喚の素ステータス + ロードアウト（構築時パッシブ）補正 + 召喚オブジェクト上乗せ | pAtk = 300 |
+| **2. additive** | バフ/デバフの固定値加算 | pAtk + 20（攻撃UP）, pAtk - 15（デバフ） |
+| **3. multiplicative** | バースト倍率、割合バフ/デバフの乗算 | pAtk × 1.15（バースト）, pAtk × 1.10（割合バフ） |
+| **4. clamp** | 特殊効果による上限/下限設定 | 「pAtk を 500 以下にする」等 |
+| **5. finalFloor** | `floor` で整数化。ステータス下限 = 0（maxHp のみ下限 1） | floor(345.5) = 345 |
+
+### 同カテゴリ内の適用順
+
+- 同じカテゴリ（例: additive 同士）の中では、**`createdSeq` 昇順**（効果が付与された順）で適用
+- 同 `createdSeq` の場合は、`initiativeTeamId` 側を先に適用
+
+### 置換型（setTo）の特殊処理
+
+- 「ステータスを N 固定にする」型の効果は、**clamp 前に適用** し、以後の additive/multiplicative を **受けない**
+- 同一ステータスに複数の setTo が存在する場合、`createdSeq` が **最も新しい** ものが有効
+
+### フィールド効果と状態効果の相互作用
+
+- フィールド効果と状態効果が同名パラメータを修正する場合も、**共通パイプラインで処理**
+- 種別ごとの優先度分離等の特例は設けない
+
+### StatRecomputed イベント
+
+ステータス再計算時にデバッグ/リプレイ検証用イベントを発行。
+
+```
+StatRecomputed {
+  entityType: character | summonUnit | summonObject
+  entityId: string
+  stat: pAtk | pDef | mAtk | mDef | spd | tech | maxHp
+  baseValue: number
+  appliedEffects: [{ id, layer, delta }]
+  finalValue: number
+}
+```
+
+### 再計算トリガー
+
+以下のタイミングで再計算を実行する。
+
+- バフ/デバフの付与時
+- バフ/デバフの解除時
+- バフ/デバフの期限切れ時
+- バースト状態の適用/解除時
+- 召喚オブジェクトの生成/消滅時
+- フィールド効果の展開/消滅時
+
+---
+
+## 6. ダメージ計算（DamageCalculator）
+
+### 基本式
+
+```
+最終ダメージ = max(1, floor(ATK * カード倍率 * 100 / (100 + DEF * 防御係数)))
+```
+
+- **防御係数**: レギュレーション定義の `defenseCoefficient`（初期値 **0.6**）
+- **最低保証**: ダメージの最低値は **1**
+
+### ダメージ種別分岐
+
+| 種別 | ATK | DEF | 計算 |
+|---|---|---|---|
+| **物理** | `pAtk`（バフ/デバフ込み） | `pDef`（バフ/デバフ込み） | 基本式 |
+| **魔法** | `mAtk`（バフ/デバフ込み） | `mDef`（バフ/デバフ込み） | 基本式 |
+| **真ダメージ** | — | — | `max(1, floor(固定値 or ATK * カード倍率))`。DEF 無視、シールド/軽減も無効 |
+
+### クリティカル判定
+
+```
+critRate = clamp((attackerTech - defenderTech * 0.5) / 500, 0.02, 0.30)
+```
+
+- **最低クリティカル率**: 2%
+- **最大クリティカル率**: 30%
+- **クリティカルダメージ倍率**: **1.5**（固定）
+- クリティカル発生時、最終ダメージに × 1.5 を乗算（端数切り捨て）
+- 判定は `rngSeed` から決定的に行う
+
+### 状態異常命中率
+
+```
+statusHitRate = clamp(baseRate + (attackerTech - defenderTech) * 0.001, 0.10, 0.95)
+```
+
+- **baseRate**: カード/状態異常定義で指定（例: 毒=0.80, 凍結=0.50）
+- **最低命中率**: 10%
+- **最大命中率**: 95%
+- 判定は `rngSeed` から決定的に行う
+
+### 端数処理
+
+- 中間計算は **小数保持**
+- 最終結果でまとめて **floor**（中間で floor しない）
+
+### 計算フロー
+
+```
+1. ダメージ種別を判定（物理/魔法/真）
+2. ATK / DEF を StatCalculator から取得（バフ/デバフ込み最終値）
+3. 基本式でダメージ算出（小数保持）
+4. クリティカル判定（RngProvider 使用）
+   → クリティカルなら × 1.5
+5. floor で整数化
+6. max(1, ...) で最低保証
+7. DamageDealt イベント発行
+```
+
+---
+
+## 7. 召喚管理（SummonManager）
+
+### 生成フロー
+
+```
+1. 召喚カード使用（手札 → graveyard）
+2. 入れ替え判定:
+   a. 既存召喚がある場合 → コスト軽減計算
+      軽減量 = floor(既存召喚の effectiveSummonCost / 2)
+      実行コスト = max(0, 新カードcost - 軽減量)
+   b. 既存召喚を SummonReplaced で除去（→ banished）
+3. ステータス算出（召喚時に1回だけ確定）:
+   summon.stat = character.stat * scaling + flat
+   ※ character.stat はバフ/デバフ込みの「バトル中ステータス」
+4. 召喚実体を生成（SummonSlotState に配置）
+5. createdSeq を付与（globalSeqCounter からインクリメント）
+6. 登場時効果（onEnterEffects）を解決
+7. SummonObjectEntered / SummonUnitEntered イベント発行
+```
+
+### 上書きルール
+
+- 召喚枠は **オブジェクト/ユニットで同一スロットを共有**
+- 新しい召喚が展開されると、既存の召喚は **上書きで除去**
+- 上書きは `SummonReplaced` イベントを発火
+- on-expire トリガーは **上書き時に発火しない**（明示的に記載がない限り）
+- 消滅した召喚実体は **追放ゾーン（banished）** へ
+
+### 期限切れ
+
+- ターン終了時に `durationTurnsRemaining` を 1 減少
+- 0 になったら消滅（`SummonObjectExpired` / `SummonUnitExpired`）
+- 消滅した召喚実体は **追放ゾーン（banished）** へ
+
+### バースト変化
+
+バースト状態適用時:
+
+```
+1. 既存召喚の burstVariantCardId を参照
+2. バースト版カード定義からステータスを再算出
+3. HP: 最大HP比で現在HPを再計算
+   newHp = floor(currentHp / oldMaxHp * newMaxHp)
+4. 寿命（durationTurnsRemaining）: 維持
+5. 状態異常/バフ: 維持
+6. 召喚ユニットの configuredActionSkillId: バースト版定義を使用
+7. isBurstVariant = true
+```
+
+バースト状態解除時:
+
+```
+1. baseVariantCardId から通常版カード定義を特定
+2. 通常版で再算出（HP比/寿命/状態の引き継ぎは同様）
+3. baseVariantCardId == null の場合（フォールバック）:
+   - 召喚はそのまま維持
+   - バースト状態によるステータスボーナスのみ解除
+```
+
+### ゾーン管理
+
+| 対象 | 移動先 |
+|---|---|
+| 召喚カード（使用時） | hand → graveyard |
+| 召喚実体（消滅時） | field → banished |
+
+- banished のカード/実体は「トラッシュ戻し」の対象外
+
+---
+
+## 8. バーストシステム（BurstManager）
+
+### ゲージ管理
+
+- **ポイント制**: 0 〜 burstMaxPoints（標準: 500）
+- **1ゲージ = 100ポイント**
+- UI表示用: `floor(burstPoints / 100)` でゲージ本数を算出
+- 溢れは切り捨て
+
+### 増加条件
+
+| 条件 | 増加量 |
+|---|---|
+| **決定速度ボーナス**（10秒以内） | +70pt |
+| **決定速度ボーナス**（20秒以内） | +50pt |
+| **決定速度ボーナス**（30秒以内） | +30pt |
+| **決定速度ボーナス**（時間切れ） | +0pt |
+| **行動チャージ**（キャラ or 召喚ユニットが行動） | +30pt（デフォルト） |
+
+- パッシブ等で蓄積率倍率がある場合: `floor(burstDeltaPoints * multiplier)`
+
+### バースト状態の適用
+
+```
+1. Burst 1本（100pt）消費
+2. バトルフェイズ開始時に対象キャラをバースト状態にする
+3. ステータス上昇（倍率式、端数floor）:
+   - pAtk × 1.15, mAtk × 1.15
+   - pDef × 1.10, mDef × 1.10
+   - spd × 1.10, tech × 1.10
+   - maxHp: 変動なし
+4. AP +2 回復（unlockedMaxAP まで）
+5. unlockedMaxAP +1 解放
+6. 召喚のバースト版への変化（SummonManager 連携）
+7. ユニークカードの強化版への変化
+8. 持続: 突入ターンを含め3ターン
+9. createdSeq を付与（ターン終了処理順に使用）
+```
+
+### バースト状態の解除
+
+```
+1. ターン終了時に remainingTurns を 1 減少
+2. remainingTurns == 0 で解除:
+   - unlockedMaxAP が非バースト最大AP上限を超えている場合、元に戻す
+   - 召喚のバースト版 → 通常版への変化
+   - ユニークカードの強化版 → 通常版への変化
+   - ステータス倍率の解除
+```
+
+### サポートカードの発動
+
+```
+1. burstPoints >= burstCostPoints を確認
+2. burstPoints -= burstCostPoints
+3. 効果解決
+4. cooldownRemainingTurns = cooldownTurns（クールダウン開始）
+5. SupportActivated イベント発行
+```
+
+---
+
+## 9. デッキ管理（DeckManager）
+
+### ドロー
+
+```
+DrawCards(state, teamId, count):
+  1. drawCount = count（通常: 生存キャラ数）
+  2. while drawCount > 0:
+     a. deck が空なら ReshuffleDeck(state, teamId)
+     b. deck の先頭からカードを取り出し hand へ追加
+     c. drawCount--
+  3. CardDrawn イベント発行（各枚）
+```
+
+### デッキ再構築
+
+```
+ReshuffleDeck(state, teamId):
+  1. rngStepBefore = rng.CurrentStep
+  2. graveyard のカード全てを deck に移動
+  3. Fisher-Yates シャッフル（rngSeed ベース）
+  4. rngStepAfter = rng.CurrentStep
+  5. DeckReshuffledFromTrash イベント発行:
+     - trashReturnedCount
+     - banishedIgnoredCount
+     - rngSeedSnapshot, rngStepBefore, rngStepAfter
+     - shuffleAlgorithm: "fisher-yates"
+```
+
+### ゾーン移動
+
+| ゾーン | 役割 |
+|---|---|
+| **deck** | 山札（ドロー元） |
+| **hand** | 手札（使用可能なカード） |
+| **graveyard** | トラッシュ（使用済みカード。デッキ再構築時に戻る） |
+| **banished** | 追放（召喚実体消滅先。デッキ再構築の対象外） |
+
+- ゾーン間の移動は常にイベントとして記録する
+
+---
+
+## 10. 状態異常/バフ処理（StatusEffectProcessor）
+
+### 付与フロー
+
+```
+ApplyStatus(state, target, statusDef, source):
+  1. immune チェック:
+     - target に immuneTo タグが一致する immune 効果があれば無効化
+     - StatusApplied(immune) イベント発行
+     - return
+  2. 命中判定（デバフの場合）:
+     - statusHitRate を算出（tech 依存）
+     - RngProvider で判定
+     - 失敗なら return
+  3. stackingRule による分岐:
+     a. replace:
+        - 既存の同名状態を除去
+        - 新しい状態を付与
+     b. extend:
+        - 既存の同名状態の remainingTurns に duration を加算
+     c. stack:
+        - 既存スタック数 < maxStacks なら新しいスタックを追加
+        - maxStacks に達している場合は無視
+  4. createdSeq を付与（globalSeqCounter）
+  5. StatusApplied イベント発行
+```
+
+### 期限切れ
+
+- ターン終了時に `duration` を 1 減少（`createdSeq` 昇順）
+- 0 になったら除去し、`StatusExpired` イベント発行
+
+### 解除（dispel）
+
+```
+DispelStatus(state, target, category, count):
+  1. 対象の purgeable タグ付き状態を収集
+  2. category (buff/debuff) でフィルタ
+  3. createdSeq 昇順（古い方から）で count 件を解除
+  4. StatusExpired(dispelled) イベント発行（各件）
+```
+
+### 効果タイプ分岐
+
+| type | 処理 |
+|---|---|
+| **dot** | ターン開始/終了等のトリガータイミングで固定ダメージ or %ダメージ。`isHeal=true` なら回復 |
+| **statMod** | StatCalculator のパイプラインに additive/multiplicative として参加 |
+| **actionBlock** | 行動解決前に判定。`skip` なら行動スキップ、`chance` なら確率で不発 |
+| **misc** | 上記に当てはまらない特殊効果（個別実装） |
+
+---
+
+## 11. 乱数管理（RngProvider）
+
+### 決定的 RNG
+
+- **seed ベース** の疑似乱数生成器を使用
+- 同一 seed からは常に同一の乱数列が生成される
+- リプレイ時に同一 seed を与えれば完全再現可能
+
+### 用途
+
+| 用途 | タイミング |
+|---|---|
+| **initiativeTeamId 決定** | MatchSetup |
+| **デッキシャッフル** | MatchSetup, DeckReshuffle |
+| **クリティカル判定** | DamageCalculator |
+| **状態異常命中判定** | StatusEffectProcessor |
+
+### ステップ記録
+
+- 各乱数使用時に `rngStepBefore` / `rngStepAfter` を記録
+- イベントログに含めることで、リプレイ検証時に乱数の消費を追跡可能
+
+### 実装方針
+
+- C# の `System.Random` は seed 対応だが、バージョン間で挙動が異なる可能性がある
+- **推奨**: xoshiro256 等の明確な仕様を持つアルゴリズムを採用し、プラットフォーム非依存を保証する
+
+---
+
+## 12. C# クラス/インターフェース設計
+
+### コア
+
+#### IGameState / GameState
+
+ゲーム全体の状態を保持する。
+
+```csharp
+public interface IGameState
+{
+    int Turn { get; }
+    Phase CurrentPhase { get; }
+    string InitiativeTeamId { get; }
+    IEventQueue EventQueue { get; }
+    TeamState[] Teams { get; }  // [2]
+    int GlobalSeqCounter { get; }
+    IRngProvider Rng { get; }
+}
+
+public class GameState : IGameState
+{
+    public int Turn { get; set; }
+    public Phase CurrentPhase { get; set; }
+    public string InitiativeTeamId { get; set; }
+    public IEventQueue EventQueue { get; set; }
+    public TeamState[] Teams { get; set; }
+    public int GlobalSeqCounter { get; set; }
+    public IRngProvider Rng { get; set; }
+
+    /// <summary>globalSeqCounter をインクリメントして返す</summary>
+    public int NextSeq() => ++GlobalSeqCounter;
+}
+
+public enum Phase
+{
+    MatchSetup,
+    TurnStart,
+    Draw,
+    Preparation,
+    Battle,
+    TurnEnd,
+    GameEnd
+}
+```
+
+#### IEventQueue / EventQueue
+
+```csharp
+public interface IEventQueue
+{
+    void Enqueue(GameEvent evt);
+    GameEvent Dequeue();
+    bool HasPending { get; }
+    int Count { get; }
+}
+
+public class EventQueue : IEventQueue
+{
+    private readonly Queue<GameEvent> queue = new();
+
+    public void Enqueue(GameEvent evt) => queue.Enqueue(evt);
+    public GameEvent Dequeue() => queue.Dequeue();
+    public bool HasPending => queue.Count > 0;
+    public int Count => queue.Count;
+}
+```
+
+#### GameEvent（基底）+ 各イベント型
+
+```csharp
+public abstract class GameEvent
+{
+    public int Turn { get; set; }
+    public Phase Phase { get; set; }
+    public long Timestamp { get; set; }
+}
+
+// 代表的なイベント型
+public class TurnStartedEvent : GameEvent { }
+public class TurnEndedEvent : GameEvent { }
+public class PhaseChangedEvent : GameEvent
+{
+    public Phase NewPhase { get; set; }
+}
+
+public class ActionResolvedEvent : GameEvent
+{
+    public string ActionId { get; set; }
+    public ActorType ActorType { get; set; }
+    public string ActorId { get; set; }
+    public string CardId { get; set; }
+    public ActionOutcome ResolvedAs { get; set; }  // Executed / Fizzled
+    public FizzleReason? FizzleReason { get; set; }
+    public ActivationMode ActivationMode { get; set; }  // Normal / Interrupt
+    public int ApBefore { get; set; }
+    public int ApCostApplied { get; set; }
+    public int ApAfter { get; set; }
+    public ActionSortKey SortKey { get; set; }
+    public TieBreakLevel TieBreakLevelUsed { get; set; }
+}
+
+public class DamageDealtEvent : GameEvent
+{
+    public string SourceId { get; set; }
+    public string TargetId { get; set; }
+    public int Amount { get; set; }
+    public DamageType DamageType { get; set; }
+    public bool IsCritical { get; set; }
+}
+
+public class StatusAppliedEvent : GameEvent
+{
+    public string TargetId { get; set; }
+    public string StatusId { get; set; }
+    public string SourceId { get; set; }
+    public int Duration { get; set; }
+}
+
+public class CardDrawnEvent : GameEvent
+{
+    public string TeamId { get; set; }
+    public string CardId { get; set; }
+}
+
+public class DeckReshuffledEvent : GameEvent
+{
+    public string TeamId { get; set; }
+    public int TrashReturnedCount { get; set; }
+    public int BanishedIgnoredCount { get; set; }
+    public int RngStepBefore { get; set; }
+    public int RngStepAfter { get; set; }
+}
+
+public class SummonEnteredEvent : GameEvent
+{
+    public string SummonInstanceId { get; set; }
+    public string CardId { get; set; }
+    public string OwnerCharacterId { get; set; }
+    public SummonType SummonType { get; set; }  // Object / Unit
+}
+
+public class SummonExpiredEvent : GameEvent
+{
+    public string SummonInstanceId { get; set; }
+    public SummonType SummonType { get; set; }
+}
+
+public class SummonReplacedEvent : GameEvent
+{
+    public string OldSummonInstanceId { get; set; }
+    public string NewSummonInstanceId { get; set; }
+}
+
+public class StatRecomputedEvent : GameEvent
+{
+    public EntityType EntityType { get; set; }
+    public string EntityId { get; set; }
+    public StatType Stat { get; set; }
+    public int BaseValue { get; set; }
+    public List<AppliedEffect> AppliedEffects { get; set; }
+    public int FinalValue { get; set; }
+}
+```
+
+#### IRngProvider / SeededRng
+
+```csharp
+public interface IRngProvider
+{
+    int CurrentStep { get; }
+    double NextDouble();
+    int NextInt(int minInclusive, int maxExclusive);
+
+    /// <summary>Fisher-Yates シャッフル</summary>
+    void Shuffle<T>(IList<T> list);
+}
+
+public class SeededRng : IRngProvider
+{
+    private readonly long seed;
+    public int CurrentStep { get; private set; }
+
+    public SeededRng(long seed)
+    {
+        this.seed = seed;
+        CurrentStep = 0;
+    }
+
+    public double NextDouble() { /* xoshiro256 等 */ CurrentStep++; /* ... */ }
+    public int NextInt(int min, int max) { /* ... */ }
+
+    public void Shuffle<T>(IList<T> list)
+    {
+        for (int i = list.Count - 1; i > 0; i--)
+        {
+            int j = NextInt(0, i + 1);
+            (list[i], list[j]) = (list[j], list[i]);
+        }
+    }
+}
+```
+
+### プロセッサ
+
+#### ITurnProcessor / TurnProcessor
+
+```csharp
+public interface ITurnProcessor
+{
+    /// <summary>1ターン全体を処理する</summary>
+    GameState ProcessTurn(GameState state);
+
+    /// <summary>指定フェイズを処理する</summary>
+    GameState ProcessPhase(GameState state, Phase phase);
+}
+
+public class TurnProcessor : ITurnProcessor
+{
+    private readonly IDeckManager deckManager;
+    private readonly IActionResolver actionResolver;
+    private readonly IStatusEffectProcessor statusEffectProcessor;
+    private readonly IBurstManager burstManager;
+    private readonly ISummonManager summonManager;
+
+    public TurnProcessor(
+        IDeckManager deckManager,
+        IActionResolver actionResolver,
+        IStatusEffectProcessor statusEffectProcessor,
+        IBurstManager burstManager,
+        ISummonManager summonManager)
+    {
+        this.deckManager = deckManager;
+        this.actionResolver = actionResolver;
+        this.statusEffectProcessor = statusEffectProcessor;
+        this.burstManager = burstManager;
+        this.summonManager = summonManager;
+    }
+
+    public GameState ProcessTurn(GameState state)
+    {
+        state = ProcessPhase(state, Phase.TurnStart);
+        state = ProcessPhase(state, Phase.Draw);
+        state = ProcessPhase(state, Phase.Preparation);
+        state = ProcessPhase(state, Phase.Battle);
+        state = ProcessPhase(state, Phase.TurnEnd);
+        return state;
+    }
+
+    public GameState ProcessPhase(GameState state, Phase phase) { /* ... */ }
+}
+```
+
+#### IActionResolver / ActionResolver
+
+```csharp
+public interface IActionResolver
+{
+    /// <summary>予約行動を解決し、結果リストを返す</summary>
+    List<ActionResult> ResolveActions(GameState state, List<PlannedAction> actions);
+
+    /// <summary>不発チェック</summary>
+    bool CheckFizzle(GameState state, PlannedAction action, out FizzleReason reason);
+
+    /// <summary>行動をソートキーで並び替える</summary>
+    List<PlannedAction> SortActions(GameState state, List<PlannedAction> actions);
+}
+```
+
+#### IStatCalculator / StatCalculator
+
+```csharp
+public interface IStatCalculator
+{
+    /// <summary>5段階パイプラインで最終ステータスを算出</summary>
+    int CalculateFinalStat(StatType stat, int baseValue, List<StatModifier> modifiers);
+
+    /// <summary>キャラの全ステータスを再計算</summary>
+    void RecomputeAllStats(GameState state, string entityId, EntityType entityType);
+}
+
+public class StatCalculator : IStatCalculator
+{
+    public int CalculateFinalStat(StatType stat, int baseValue, List<StatModifier> modifiers)
+    {
+        // 1. setTo チェック（最新の createdSeq が有効）
+        // 2. additive を createdSeq 昇順で加算
+        // 3. multiplicative を createdSeq 昇順で乗算
+        // 4. clamp 適用
+        // 5. floor + 下限0（maxHp は下限1）
+        return 0; // placeholder
+    }
+
+    public void RecomputeAllStats(GameState state, string entityId, EntityType entityType)
+    {
+        // 全ステータスに対して CalculateFinalStat を呼び出し
+        // StatRecomputed イベントを発行
+    }
+}
+```
+
+#### IDamageCalculator / DamageCalculator
+
+```csharp
+public interface IDamageCalculator
+{
+    /// <summary>ダメージを計算する</summary>
+    DamageResult CalculateDamage(AttackContext context);
+
+    /// <summary>クリティカル判定</summary>
+    bool RollCritical(AttackContext context, IRngProvider rng);
+
+    /// <summary>状態異常命中判定</summary>
+    bool RollStatusHit(float baseRate, int attackerTech, int defenderTech, IRngProvider rng);
+}
+
+public struct AttackContext
+{
+    public string AttackerId;
+    public string DefenderId;
+    public DamageType DamageType;
+    public float CardMultiplier;
+    public int Atk;           // StatCalculator で算出済みの最終値
+    public int Def;           // 同上
+    public int AttackerTech;
+    public int DefenderTech;
+    public float DefenseCoefficient;
+}
+
+public struct DamageResult
+{
+    public int FinalDamage;
+    public bool IsCritical;
+    public int RawDamage;      // クリティカル前
+}
+```
+
+#### ITriggerSystem / TriggerSystem
+
+```csharp
+public interface ITriggerSystem
+{
+    /// <summary>イベントに対してトリガー条件をスキャンし、発動対象を返す</summary>
+    List<TriggeredAction> ScanTriggers(GameState state, GameEvent evt);
+
+    /// <summary>無限ループ対策用の誘発カウンタを管理</summary>
+    bool CanTrigger(string entityId, Phase currentPhase);
+}
+```
+
+#### ISummonManager / SummonManager
+
+```csharp
+public interface ISummonManager
+{
+    /// <summary>召喚を生成する</summary>
+    GameState CreateSummon(GameState state, string characterId, string summonCardId);
+
+    /// <summary>召喚を除去する</summary>
+    GameState RemoveSummon(GameState state, string summonInstanceId, SummonRemovalReason reason);
+
+    /// <summary>バースト版への変化</summary>
+    GameState TransformToBurstVariant(GameState state, string characterId);
+
+    /// <summary>通常版への変化（バースト解除時）</summary>
+    GameState TransformToBaseVariant(GameState state, string characterId);
+
+    /// <summary>入れ替えコスト軽減を算出</summary>
+    int CalculateReplacementCostReduction(GameState state, string characterId);
+}
+```
+
+#### IBurstManager / BurstManager
+
+```csharp
+public interface IBurstManager
+{
+    /// <summary>バーストポイントを加算</summary>
+    GameState AddBurstPoints(GameState state, string teamId, int points);
+
+    /// <summary>バースト状態を適用</summary>
+    GameState ApplyBurstMode(GameState state, string characterId);
+
+    /// <summary>バースト状態を解除</summary>
+    GameState RemoveBurstMode(GameState state, string characterId);
+
+    /// <summary>サポートカードを発動</summary>
+    GameState ActivateSupport(GameState state, string teamId, string supportCardId);
+
+    /// <summary>決定速度ボーナスを算出</summary>
+    int CalculateDecisionSpeedBonus(int decisionTimeMs);
+}
+```
+
+#### IDeckManager / DeckManager
+
+```csharp
+public interface IDeckManager
+{
+    /// <summary>カードをドローする</summary>
+    GameState DrawCards(GameState state, string teamId, int count);
+
+    /// <summary>デッキを再構築する（トラッシュ→デッキ）</summary>
+    GameState ReshuffleDeck(GameState state, string teamId);
+
+    /// <summary>カードをゾーン間で移動する</summary>
+    GameState MoveCard(GameState state, string teamId, string cardId, CardZone from, CardZone to);
+}
+
+public enum CardZone
+{
+    Deck,
+    Hand,
+    Graveyard,
+    Banished
+}
+```
+
+#### IStatusEffectProcessor / StatusEffectProcessor
+
+```csharp
+public interface IStatusEffectProcessor
+{
+    /// <summary>状態を付与する</summary>
+    GameState ApplyStatus(GameState state, string targetId, StatusEffectDefinition statusDef,
+                          string sourceId, int duration);
+
+    /// <summary>状態を解除する（dispel）</summary>
+    GameState DispelStatus(GameState state, string targetId, string category, int count);
+
+    /// <summary>ターン終了時の期限切れ処理</summary>
+    GameState ProcessExpiration(GameState state);
+
+    /// <summary>DoT/HoT の効果を適用する</summary>
+    GameState ProcessDotEffects(GameState state, string targetId);
+}
+```
+
+### データモデル（`07_data_model.md` 準拠）
+
+```csharp
+// --- チーム/キャラ ---
+public class TeamState
+{
+    public string Id { get; set; }
+    public CharacterState[] Characters { get; set; }  // [3]
+    public ResourcesState Resources { get; set; }
+    public List<string> Deck { get; set; }
+    public List<string> Hand { get; set; }
+    public List<string> Graveyard { get; set; }
+    public List<string> Banished { get; set; }
+    public SupportSlotState[] SupportSet { get; set; }
+    public List<PlannedAction> PlannedActions { get; set; }
+    public PreparationDecisionState Decision { get; set; }
+    public FieldEffectInstance FieldEffect { get; set; }  // nullable
+}
+
+public class CharacterState
+{
+    public string Id { get; set; }
+    public int Hp { get; set; }
+    public int MaxHp { get; set; }
+    public bool IsDown { get; set; }
+    public CharacterStats Stats { get; set; }
+    public List<StatusEffect> Statuses { get; set; }
+    public int Ap { get; set; }
+    public int UnlockedMaxAP { get; set; }
+    public int ApCap { get; set; }
+    public int ApRegen { get; set; }
+    public List<CharacterPassiveInstance> Passives { get; set; }
+    public List<LoadoutPassiveInstance> LoadoutPassives { get; set; }
+    public UniqueSlotState Unique { get; set; }
+    public ItemInstance Item { get; set; }  // nullable, max 1
+    public SummonSlotState SummonSlot { get; set; }  // nullable
+    public BurstState Burst { get; set; }
+    public ElementCounters Elements { get; set; }
+}
+
+public class CharacterStats
+{
+    public int PAtk { get; set; }
+    public int PDef { get; set; }
+    public int MAtk { get; set; }
+    public int MDef { get; set; }
+    public int Spd { get; set; }
+    public int Tech { get; set; }
+}
+
+// --- バースト ---
+public class BurstState
+{
+    public bool IsBurst { get; set; }
+    public int RemainingTurns { get; set; }
+    public int CreatedSeq { get; set; }
+}
+
+public class ResourcesState
+{
+    public int BurstPoints { get; set; }
+    public int BurstMaxPoints { get; set; }
+}
+
+// --- 召喚 ---
+public class SummonSlotState
+{
+    public SummonObjectInstance Object { get; set; }  // nullable
+    public SummonUnitInstance Unit { get; set; }       // nullable
+}
+
+public class SummonObjectInstance
+{
+    public string InstanceId { get; set; }
+    public string CardId { get; set; }
+    public string OwnerTeamId { get; set; }
+    public string OwnerCharacterId { get; set; }
+    public int DurationTurnsRemaining { get; set; }
+    public int CreatedSeq { get; set; }
+    public CharacterStats Stats { get; set; }
+    public bool IsBurstVariant { get; set; }
+    public string BaseVariantCardId { get; set; }
+    public int EffectiveSummonCost { get; set; }
+}
+
+public class SummonUnitInstance
+{
+    public string InstanceId { get; set; }
+    public string CardId { get; set; }
+    public string OwnerTeamId { get; set; }
+    public string OwnerCharacterId { get; set; }
+    public int DurationTurnsRemaining { get; set; }
+    public int Hp { get; set; }
+    public int MaxHp { get; set; }
+    public CharacterStats Stats { get; set; }
+    public List<string> Passives { get; set; }
+    public List<string> ActionSkills { get; set; }
+    public string ConfiguredActionSkillId { get; set; }
+    public bool HasActedThisTurn { get; set; }
+    public int CreatedSeq { get; set; }
+    public bool IsBurstVariant { get; set; }
+    public string BaseVariantCardId { get; set; }
+}
+
+// --- カード定義 ---
+public abstract class CardDefinition
+{
+    public string Id { get; set; }
+    public string Name { get; set; }
+    public CardType Type { get; set; }
+    public string Color { get; set; }
+    public int Cost { get; set; }
+    public int Priority { get; set; }
+    public string RulesText { get; set; }
+    public List<string> Tags { get; set; }
+    public CardTrigger Trigger { get; set; }  // nullable
+    public Dictionary<string, int> ElementCost { get; set; }
+    public Dictionary<string, int> ElementGain { get; set; }
+    public List<EffectSpec> SetEffects { get; set; }
+}
+
+public class SkillCardDefinition : CardDefinition
+{
+    public EffectSpec Effect { get; set; }
+}
+
+public class SummonObjectCardDefinition : CardDefinition
+{
+    public int DurationTurns { get; set; }
+    public ScalingSpec ObjectScaling { get; set; }
+    public FlatStatBonus ObjectFlatStats { get; set; }
+    public List<EffectSpec> OnEnterEffects { get; set; }
+    public string BurstVariantCardId { get; set; }
+}
+
+public class SummonUnitCardDefinition : CardDefinition
+{
+    public int DurationTurns { get; set; }
+    public ScalingSpec UnitScaling { get; set; }
+    public FlatStatBonus UnitFlatStats { get; set; }
+    public List<EffectSpec> OnEnterEffects { get; set; }
+    public string BurstVariantCardId { get; set; }
+}
+
+public class SupportCardDefinition : CardDefinition
+{
+    public int BurstCostPoints { get; set; }
+    public int CooldownTurns { get; set; }
+    public EffectSpec Effect { get; set; }
+}
+
+public class UniqueCardDefinition : CardDefinition
+{
+    public int CooldownTurns { get; set; }
+    public EffectSpec Effect { get; set; }
+    public string BurstVariantCardId { get; set; }
+}
+
+public enum CardType
+{
+    Skill,
+    SummonObject,
+    SummonUnit,
+    Item,
+    Support,
+    Unique
+}
+
+// --- 状態異常 ---
+public class StatusEffect
+{
+    public string Id { get; set; }
+    public string SourceId { get; set; }
+    public string TargetId { get; set; }
+    public int Duration { get; set; }
+    public int CreatedSeq { get; set; }
+    public StatusEffectType EffectType { get; set; }
+    public StackingRule StackingRule { get; set; }
+    public List<string> Tags { get; set; }
+}
+
+public class StatusEffectDefinition
+{
+    public string Id { get; set; }
+    public string Name { get; set; }
+    public string Category { get; set; }  // buff / debuff
+    public StackingRule StackingRule { get; set; }
+    public int DefaultDuration { get; set; }
+    public StatusEffectType Effect { get; set; }
+    public List<string> Triggers { get; set; }
+    public float BaseHitRate { get; set; }
+    public List<string> Tags { get; set; }
+}
+
+public class StackingRule
+{
+    public StackingMode Mode { get; set; }  // Replace / Extend / Stack
+    public int? MaxStacks { get; set; }
+}
+
+public enum StackingMode { Replace, Extend, Stack }
+
+// --- 行動 ---
+public class PlannedAction
+{
+    public string Id { get; set; }
+    public string TeamId { get; set; }
+    public ActorType ActorType { get; set; }
+    public string ActorId { get; set; }
+    public ActionSource Source { get; set; }
+    public string CardId { get; set; }
+    public TargetSpec Targets { get; set; }
+    public int Sequence { get; set; }
+    public long CreatedAtMs { get; set; }
+    public int CardPriority { get; set; }
+    public int WillConsumeApOnExecute { get; set; }
+}
+
+public class ActionResult
+{
+    public string ActionId { get; set; }
+    public ActionOutcome Outcome { get; set; }
+    public FizzleReason? FizzleReason { get; set; }
+    public ActivationMode ActivationMode { get; set; }
+    public int ApBefore { get; set; }
+    public int ApCostApplied { get; set; }
+    public int ApAfter { get; set; }
+}
+
+public enum ActorType { Character, Summon }
+public enum ActionSource { Hand, Support, Unique, SummonConfigured }
+public enum ActionOutcome { Executed, Fizzled }
+public enum ActivationMode { Normal, Interrupt }
+public enum FizzleReason { InsufficientAP, InvalidTarget, InsufficientElement, CooldownActive }
+public enum TieBreakLevel { Priority, Spd, SubmitTime, Initiative, CreatedSeq }
+
+// --- 補助型 ---
+public class ActionSortKey
+{
+    public int Priority { get; set; }
+    public int Spd { get; set; }
+    public long DecisionSubmittedAtMs { get; set; }
+    public string InitiativeTeamId { get; set; }
+    public int CreatedSeq { get; set; }
+}
+
+public class CardTrigger
+{
+    public string Name { get; set; }
+    public string Event { get; set; }
+    public string Condition { get; set; }
+}
+
+public class TargetSpec
+{
+    public TargetMode Mode { get; set; }
+    public List<string> TargetIds { get; set; }
+}
+
+public enum TargetMode
+{
+    Self, AllyCharacter, EnemyCharacter,
+    AllySummonUnit, EnemySummonUnit,
+    AllySummonObject, EnemySummonObject,
+    AllAllies, AllEnemies, Random
+}
+
+public class ScalingSpec
+{
+    public float PAtk { get; set; }
+    public float PDef { get; set; }
+    public float MAtk { get; set; }
+    public float MDef { get; set; }
+    public float Hp { get; set; }
+    public float Spd { get; set; }
+    public float Tech { get; set; }
+}
+
+public class FlatStatBonus
+{
+    public int PAtk { get; set; }
+    public int PDef { get; set; }
+    public int MAtk { get; set; }
+    public int MDef { get; set; }
+    public int Hp { get; set; }
+    public int Spd { get; set; }
+    public int Tech { get; set; }
+}
+
+public class StatModifier
+{
+    public string SourceId { get; set; }
+    public ModifierLayer Layer { get; set; }
+    public float Value { get; set; }
+    public int CreatedSeq { get; set; }
+}
+
+public enum ModifierLayer { Additive, Multiplicative, Clamp, SetTo }
+public enum StatType { PAtk, PDef, MAtk, MDef, Spd, Tech, MaxHp }
+public enum EntityType { Character, SummonUnit, SummonObject }
+public enum DamageType { Physical, Magical, True }
+public enum SummonType { Object, Unit }
+public enum SummonRemovalReason { Expired, Destroyed, Replaced }
+
+public struct AppliedEffect
+{
+    public string Id { get; set; }
+    public ModifierLayer Layer { get; set; }
+    public int Delta { get; set; }
+}
+
+public class TriggeredAction
+{
+    public string EntityId { get; set; }
+    public string CardId { get; set; }
+    public PlannedAction Action { get; set; }
+}
+
+// --- その他 ---
+public class ElementCounters
+{
+    public int Red { get; set; }
+    public int Blue { get; set; }
+    public int Green { get; set; }
+    public int Orange { get; set; }
+    public int Yellow { get; set; }
+    public int Purple { get; set; }
+}
+
+public class ItemInstance
+{
+    public string InstanceId { get; set; }
+    public string CardId { get; set; }
+    public string OwnerTeamId { get; set; }
+    public string OwnerCharacterId { get; set; }
+    public int CountRemaining { get; set; }
+    public int CreatedSeq { get; set; }
+    public List<CardTrigger> Triggers { get; set; }
+}
+
+public class FieldEffectInstance
+{
+    public string InstanceId { get; set; }
+    public string OwnerTeamId { get; set; }
+    public string SourceTeamId { get; set; }
+    public int CreatedSeq { get; set; }
+    public int RemainingTurns { get; set; }  // -1 for infinite
+}
+
+public class SupportSlotState
+{
+    public string CardId { get; set; }
+    public int CooldownRemainingTurns { get; set; }
+    public int CreatedSeq { get; set; }
+}
+
+public class UniqueSlotState
+{
+    public string EquippedUniqueCardId { get; set; }
+    public int CooldownRemainingTurns { get; set; }
+    public int CreatedSeq { get; set; }
+    public string EffectiveUniqueCardId { get; set; }  // バースト中の差し替え結果
+}
+
+public class PreparationDecisionState
+{
+    public long? SubmittedAtMs { get; set; }
+    public int DecisionSpeedBonusPoints { get; set; }
+}
+
+public class RegulationDefinition
+{
+    public string Id { get; set; }
+    public string Name { get; set; }
+    public int TeamSize { get; set; }
+    public int SupportSetMax { get; set; }
+    public int MaxTurns { get; set; }
+    public int PreparationTimeSec { get; set; }
+    public int InitialHandSize { get; set; }
+    public int ApStart { get; set; }
+    public int BurstMax { get; set; }
+    public int BurstMaxPoints { get; set; }
+    public int ActionChargePoints { get; set; }
+    public float DefenseCoefficient { get; set; }
+    public string VictoryCondition { get; set; }
+}
+```
+
+### データフロー例: 1ターンの処理
+
+```
+GameManager.StartMatch(regulation, team1, team2)
+  └→ GameState 初期化
+  └→ TurnProcessor.ProcessTurn(state)
+       ├→ ProcessPhase(TurnStart)
+       │    ├→ StatusEffectProcessor: ターン開始トリガー
+       │    ├→ SummonManager: hasActedThisTurn リセット
+       │    └→ AP 解放/回復
+       ├→ ProcessPhase(Draw)
+       │    └→ DeckManager.DrawCards(state, teamId, aliveCount)
+       ├→ ProcessPhase(Preparation)
+       │    └→ 外部入力: PlannedAction[] を受け取る
+       ├→ ProcessPhase(Battle)
+       │    ├→ BurstManager: 決定速度ボーナス加算
+       │    ├→ BurstManager.ApplyBurstMode (予約あれば)
+       │    │    └→ SummonManager.TransformToBurstVariant
+       │    ├→ ActionResolver.SortActions
+       │    └→ ActionResolver.ResolveActions
+       │         ├→ CheckFizzle → skip or continue
+       │         ├→ DamageCalculator.CalculateDamage
+       │         ├→ StatCalculator.RecomputeAllStats
+       │         ├→ TriggerSystem.ScanTriggers
+       │         ├→ BurstManager.AddBurstPoints (+30)
+       │         └→ StatusEffectProcessor.ApplyStatus
+       └→ ProcessPhase(TurnEnd)
+            ├→ 全永続効果を createdSeq 昇順で処理
+            ├→ StatusEffectProcessor.ProcessExpiration
+            ├→ SummonManager.RemoveSummon (期限切れ)
+            ├→ BurstManager.RemoveBurstMode (期限切れ)
+            └→ 勝敗判定 / maxTurns 判定
+```
