@@ -51,6 +51,12 @@ C# 実装の全体像を定義する。
 │  │ ディスパッチ)│ │ /上書き) │ │ バースト)  │          │
 │  └──────────────┘ └──────────┘ └───────────┘           │
 │                                                         │
+│  ┌──────────┐ ┌───────────────┐ ┌───────────┐           │
+│  │ItemMgr   │ │FieldEffectMgr │ │ShieldProc │           │
+│  │(セット/  │ │(展開/消滅/   │ │(付与/吸収/│           │
+│  │ 自動発動)│ │ 上書き)       │ │ 期限切れ) │           │
+│  └──────────┘ └───────────────┘ └───────────┘           │
+│                                                         │
 │  ┌───────────┐                                          │
 │  │RngProvider│                                          │
 │  │(決定的   │                                          │
@@ -81,6 +87,9 @@ C# 実装の全体像を定義する。
 | **BurstManager** | バーストゲージ管理・バースト状態の適用/解除 |
 | **DeckManager** | デッキ操作（ドロー/再構築/ゾーン移動） |
 | **StatusEffectProcessor** | 状態異常/バフの付与/解除/期限切れ |
+| **ItemManager** | アイテムのセット/自動発動/破棄/上書き |
+| **FieldEffectManager** | フィールド効果の展開/消滅/上書き |
+| **ShieldProcessor** | シールドの付与/ダメージ吸収/期限切れ |
 | **RngProvider** | 決定的乱数生成（seedベース） |
 
 ### 依存関係
@@ -91,13 +100,19 @@ GameManager → TurnProcessor → ActionResolver → EffectResolver → DamageCa
                                                                → DeckManager
                                                                → SummonManager
                                                                → BurstManager
+                                                               → ShieldProcessor
+                                                               → ItemManager
+                                                               → FieldEffectManager
                                              → StatCalculator
-                                             → TriggerSystem
+                                             → TriggerSystem → ItemManager（アイテム自動発動）
                             → DeckManager
                             → StatusEffectProcessor
                             → SummonManager → StatCalculator
                             → BurstManager → SummonManager
                                            → StatCalculator
+                            → ShieldProcessor
+                            → ItemManager
+                            → FieldEffectManager → StatCalculator
 全モジュール → EventQueue（イベント発行）
 全モジュール → RngProvider（乱数が必要な場合）
 ```
@@ -1050,7 +1065,374 @@ DeployFieldEffect(state, ownerTeamId, fieldEffectDef, context):
 
 ---
 
+## 11.5. GameManager（マッチライフサイクル）
+
+### 責務
+
+- マッチの開始から終了までの全体制御
+- GameState の初期化（MatchSetup）
+- ターンループの駆動（TurnProcessor へ委譲）
+- 勝敗判定と GameEnd 処理
+
+### マッチライフサイクル
+
+```
+RunMatch(regulation, team1Config, team2Config, rngSeed):
+  1. MatchSetup: GameState を初期化
+  2. ターンループ:
+     while (state.CurrentPhase != GameEnd):
+       state = turnProcessor.ProcessTurn(state)
+       state = CheckVictoryAndAdvance(state)
+  3. return MatchResult（勝者/敗者/イベントログ）
+```
+
+### MatchSetup 詳細処理フロー
+
+```
+InitializeMatch(regulation, team1Config, team2Config, rngSeed):
+  ── 1. 基盤初期化 ──
+  1a. GameState を生成（turn=0, phase=MatchSetup）
+  1b. RngProvider を rngSeed で初期化
+  1c. globalSeqCounter = 0
+
+  ── 2. チーム構築 ──
+  各チーム (team1, team2) について:
+    2a. TeamState を生成（id, deck=[], hand=[], graveyard=[], banished=[]）
+    2b. ResourcesState を初期化:
+        - burstPoints = 0
+        - burstMaxPoints = regulation.burstMaxPoints（標準: 500）
+    2c. 各キャラ (3体) の CharacterState を生成:
+        - hp = maxHp（キャラ定義から）
+        - ap = regulation.apStart（標準: 3）
+        - unlockedMaxAP = regulation.apStart
+        - apCap = キャラ定義の上限（標準: 10）
+        - apRegen = キャラ定義の回復量（標準: 1）
+        - isDown = false
+        - elements = 全色 0
+        - shield = null
+        - summonSlot = null
+    2d. ユニークカードの装備:
+        - unique.equippedUniqueCardId = 選択されたユニークID
+        - unique.cooldownRemainingTurns = 0
+        - unique.createdSeq = state.NextSeq()
+    2e. サポートカードの配置:
+        - supportSet に最大3枚を配置
+        - 各スロットの cooldownRemainingTurns = 0
+
+  ── 3. セット効果の解決 ──
+  3a. キャラデッキのセット効果（scope: self）:
+      各キャラの各カードについて:
+        card.setEffects が存在する場合
+          → EffectResolver.ResolveEffect(state, setEffect, context{sourceType: "setEffect"})
+          → 主に StatusApply（永続 statMod）を想定
+      ※ 解決順: キャラ1 → キャラ2 → キャラ3（チーム内順序）
+  3b. サポートカードのセット効果（scope: team）:
+      各サポートカードについて:
+        card.setEffects が存在する場合
+          → EffectResolver.ResolveEffect(...)
+      ※ 解決順: スロット1 → スロット2 → スロット3
+  3c. セット効果で付与された LoadoutPassiveInstance を character.loadoutPassives に記録
+
+  ── 4. デッキ構築 ──
+  4a. 各キャラのキャラデッキ（10〜15枚）を結合 → チームデッキ
+  4b. Fisher-Yates シャッフル（RngProvider 使用）
+  4c. チームデッキを team.deck に設定
+
+  ── 5. 初期手札 ──
+  5a. DeckManager.DrawCards(state, teamId, regulation.initialHandSize)
+      ※ 標準: 5枚
+  5b. セット効果による追加ドロー:
+      セット効果で Draw が予約されている場合、ここで追加実行
+      ※ 初期手札5枚の「後」に処理（確定済みルール）
+
+  ── 6. イニシアチブ決定 ──
+  6a. state.initiativeTeamId = RngProvider で2チームからランダム選択
+      ※ 以降固定（更新なし）
+
+  ── 7. 完了 ──
+  7a. MatchStarted イベント発行
+  7b. state.CurrentPhase = TurnStart に遷移
+  7c. return state
+```
+
+### GameEnd 処理
+
+```
+ProcessGameEnd(state, victoryResult):
+  1. 勝者/敗者を確定
+  2. GameEndedEvent を発行:
+     - winnerId: string
+     - loserId: string
+     - reason: "allDown" | "leaderDown" | "timeout_hpRatio" | "timeout_initiative"
+     - finalTurn: number
+  3. 全イベントログを MatchResult に包んで返す
+```
+
+---
+
+## 11.6. AP管理ルール
+
+AP（アクションポイント）に関するルールが複数仕様書に分散しているため、ここに統合する。
+
+### AP 関連プロパティ
+
+| プロパティ | 初期値 | 説明 |
+|---|---|---|
+| `ap` | `apStart`（標準: 3） | 現在AP。行動で消費、ターン開始で回復 |
+| `unlockedMaxAP` | `apStart`（標準: 3） | 解放済みの最大AP。毎ターン+1で解放 |
+| `apCap` | キャラ定義（標準: 10） | AP上限。unlockedMaxAP はこれを超えない |
+| `apRegen` | キャラ定義（標準: 1） | 毎ターン回復量 |
+
+### AP ライフサイクル
+
+```
+── ターン開始フェイズ ──
+（1ターン目は処理しない: 初期値のまま）
+1. AP解放: unlockedMaxAP = min(unlockedMaxAP + 1, apCap)
+2. AP回復: ap = min(ap + apRegen, unlockedMaxAP)
+
+── 準備フェイズ ──
+3. 予約上限: 各キャラの予約コスト合計 ≤ 現在AP
+   ※ APは予約時に仮押さえしない
+
+── バトルフェイズ ──
+4. バースト状態適用時（行動解決前）:
+   - ap = min(ap + 2, unlockedMaxAP)
+   - unlockedMaxAP = min(unlockedMaxAP + 1, apCap)
+
+5. 各行動の実行時:
+   a. 不発チェック: currentAP < cost → 不発（AP消費なし）
+   b. コスト軽減: effectiveCost = max(1, originalCost - reduction)
+      ※ 0コストカードは除く（0のまま）
+   c. AP消費: ap -= effectiveCost
+
+6. APModify 効果（EffectSpec 経由）:
+   - targetStat == "current": ap = clamp(ap + amount, 0, unlockedMaxAP)
+   - targetStat == "unlockedMax": unlockedMaxAP = clamp(unlockedMaxAP + amount, 0, apCap)
+
+── ターン終了フェイズ ──
+7. バースト状態解除時:
+   - unlockedMaxAP が非バースト最大上限を超えている場合 → 非バースト上限に戻す
+   - ap > unlockedMaxAP の場合 → ap = unlockedMaxAP（超過分は切り捨て）
+```
+
+### AP 計算例
+
+```
+ターン1開始: ap=3, unlockedMaxAP=3（初期値。1ターン目は解放/回復なし）
+ターン1バトル: スキル(cost=2)使用 → ap=1
+ターン2開始: unlockedMaxAP=4, ap=min(1+1, 4)=2
+ターン2バトル: スキル(cost=1)×2使用 → ap=0
+ターン3開始: unlockedMaxAP=5, ap=min(0+1, 5)=1
+ターン3バトル: バースト適用 → ap=min(1+2, 5+1)=3, unlockedMaxAP=6
+```
+
+---
+
+## 11.7. データフロー例（EffectResolver トレース）
+
+Phase 1 実装の参考として、代表的なカードが EffectResolver を通じてどう解決されるかをトレースする。
+
+### 例1: 複合攻撃カード「毒炎斬」
+
+カード定義:
+```yaml
+id: skill_poison_flame
+name: 毒炎斬
+type: Skill
+color: purple
+cost: 3
+priority: 0
+effect:
+  effectType: Composite
+  target: { mode: enemyCharacter }
+  compositeParams:
+    children:
+      - effectType: Damage
+        damageParams:
+          damageType: physical
+          cardMultiplier: 1.2
+      - effectType: StatusApply
+        statusApplyParams:
+          statusId: status_poison
+          duration: 3
+```
+
+解決トレース:
+```
+1. ActionResolver: 行動をソート → priority=0 で実行順確定
+2. ActionResolver: 不発チェック（AP≥3, 対象存在） → OK
+3. ActionResolver: AP消費（ap -= 3）, エレメント獲得（purple += 1）
+4. ActionResolver → EffectResolver.ResolveEffect(compositeSpec, context)
+
+5. EffectResolver: EffectType=Composite → ResolveComposite()
+   5a. Target 解決: compositeSpec.target = { mode: enemyCharacter } → 対象確定
+
+   5b. child[0]: Damage
+       - Target: null → 親の target を継承（enemyCharacter）
+       - → DamageCalculator.CalculateDamage():
+         ATK = source.pAtk（StatCalculator 最終値）
+         DEF = target.pDef（StatCalculator 最終値）
+         damage = max(1, floor(ATK * 1.2 * 100 / (100 + DEF * 0.6)))
+         → クリティカル判定（RngProvider）
+         → DamageDealt イベント発行
+         → target.hp -= damage（ShieldInstance がある場合はシールド吸収を先に処理）
+
+   5c. child[1]: StatusApply
+       - Target: null → 親の target を継承
+       - → StatusEffectProcessor.ApplyStatus():
+         immune チェック → 命中判定（tech 依存, RngProvider）
+         → 命中: StatusEffect を target.statuses に追加
+         → StatusApplied イベント発行
+
+6. ActionResolver: カードを graveyard へ移動
+7. ActionResolver: ActionResolved(executed) イベント発行
+8. ActionResolver: トリガー割り込み判定、Burst+30pt、アイテム自動発動チェック
+```
+
+### 例2: 条件分岐カード「炎嵐」
+
+カード定義:
+```yaml
+id: skill_fire_storm
+name: 炎嵐
+type: Skill
+color: red
+cost: 4
+priority: -1
+effect:
+  effectType: Conditional
+  target: { mode: allEnemies }
+  conditionalParams:
+    condition:
+      conditionType: ElementThreshold
+      elementThresholdParams:
+        element: red
+        operator: gte
+        threshold: 3
+    thenEffect:
+      effectType: Damage
+      damageParams:
+        damageType: magical
+        cardMultiplier: 1.8
+    elseEffect:
+      effectType: Damage
+      damageParams:
+        damageType: magical
+        cardMultiplier: 0.9
+```
+
+解決トレース:
+```
+1. EffectResolver: EffectType=Conditional → ResolveConditional()
+2. EvaluateCondition: ElementThreshold
+   → source.elements.red >= 3 ?
+   → 例: red=4 → true
+3. true → thenEffect を解決:
+   Damage(magical, 1.8) を allEnemies に対して実行
+   → 各敵キャラに対して DamageCalculator を呼び出し
+4. （もし red=2 だった場合）
+   false → elseEffect を解決:
+   Damage(magical, 0.9) を allEnemies に対して実行
+```
+
+### 例3: セット効果（構築時パッシブ）
+
+カード定義:
+```yaml
+id: skill_heavy_blade
+name: 豪剣
+type: Skill
+cost: 4
+setEffects:
+  - effectType: Composite
+    compositeParams:
+      children:
+        - effectType: StatusApply
+          target: { mode: self }
+          statusApplyParams:
+            statusId: status_patk_up_loadout
+            duration: -1  # 永続
+        - effectType: StatusApply
+          target: { mode: self }
+          statusApplyParams:
+            statusId: status_spd_down_loadout
+            duration: -1  # 永続（デメリット）
+```
+
+解決タイミング: MatchSetup ステップ3a
+```
+1. EffectResolver: Composite → children を順次解決
+2. child[0]: StatusApply(status_patk_up_loadout, 永続)
+   → pAtk に additive +20 の永続バフを付与
+   → LoadoutPassiveInstance として記録
+3. child[1]: StatusApply(status_spd_down_loadout, 永続)
+   → spd に additive -10 の永続デバフを付与（デメリット）
+   → LoadoutPassiveInstance として記録
+4. StatCalculator で影響キャラのステータス再計算
+```
+
+---
+
 ## 12. C# クラス/インターフェース設計
+
+### GameManager
+
+#### IGameManager / GameManager
+
+```csharp
+public class MatchConfig
+{
+    public RegulationDefinition Regulation { get; set; }
+    public TeamConfig Team1 { get; set; }
+    public TeamConfig Team2 { get; set; }
+    public long RngSeed { get; set; }
+}
+
+public class TeamConfig
+{
+    public string TeamId { get; set; }
+    public List<CharacterConfig> Characters { get; set; }  // [3]
+    public List<string> SupportCardIds { get; set; }       // max 3
+}
+
+public class CharacterConfig
+{
+    public string CharacterId { get; set; }
+    public List<string> DeckCardIds { get; set; }          // 10-15
+    public string UniqueCardId { get; set; }
+}
+
+public class MatchResult
+{
+    public string WinnerId { get; set; }
+    public string LoserId { get; set; }
+    public string Reason { get; set; }  // "allDown" / "leaderDown" / "timeout_hpRatio" / "timeout_initiative"
+    public int FinalTurn { get; set; }
+    public List<GameEvent> EventLog { get; set; }
+    public GameState FinalState { get; set; }
+}
+
+public interface IGameManager
+{
+    /// <summary>マッチを初期化する</summary>
+    GameState InitializeMatch(MatchConfig config);
+
+    /// <summary>マッチを実行する（初期化→ターンループ→終了）</summary>
+    MatchResult RunMatch(MatchConfig config);
+
+    /// <summary>勝敗判定</summary>
+    VictoryResult CheckVictory(GameState state);
+}
+
+public class VictoryResult
+{
+    public bool IsDecided { get; set; }
+    public string WinnerId { get; set; }
+    public string LoserId { get; set; }
+    public string Reason { get; set; }
+}
+```
 
 ### コア
 
@@ -1561,6 +1943,66 @@ public interface IStatusEffectProcessor
 
     /// <summary>DoT/HoT の効果を適用する</summary>
     GameState ProcessDotEffects(GameState state, string targetId);
+}
+```
+
+#### IItemManager / ItemManager
+
+```csharp
+public interface IItemManager
+{
+    /// <summary>アイテムをキャラにセットする</summary>
+    GameState SetItem(GameState state, string characterId, string itemCardId);
+
+    /// <summary>アイテムの自動発動をチェック・実行する</summary>
+    GameState CheckAndTriggerItems(GameState state, GameEvent evt);
+
+    /// <summary>アイテムを除去する（破棄 or 上書き）</summary>
+    GameState RemoveItem(GameState state, string characterId, ItemRemovalReason reason);
+}
+
+public enum ItemRemovalReason { Exhausted, Overwritten }
+```
+
+#### IFieldEffectManager / FieldEffectManager
+
+```csharp
+public interface IFieldEffectManager
+{
+    /// <summary>フィールド効果を展開する</summary>
+    GameState DeployFieldEffect(GameState state, string ownerTeamId,
+                                 string fieldEffectDefId, EffectContext context);
+
+    /// <summary>フィールド効果を解除する（dispel）</summary>
+    GameState RemoveFieldEffect(GameState state, string teamId);
+
+    /// <summary>ターン終了時の期限切れ処理</summary>
+    GameState ProcessFieldEffectExpiration(GameState state);
+}
+```
+
+#### IShieldProcessor
+
+```csharp
+public interface IShieldProcessor
+{
+    /// <summary>シールドを付与する</summary>
+    GameState ApplyShield(GameState state, string targetId,
+                           ShieldEffectParams shieldParams, EffectContext context);
+
+    /// <summary>ダメージにシールド吸収を適用する</summary>
+    ShieldAbsorbResult AbsorbDamage(GameState state, string targetId,
+                                     int damage, DamageType damageType);
+
+    /// <summary>ターン終了時の期限切れ処理</summary>
+    GameState ProcessShieldExpiration(GameState state);
+}
+
+public struct ShieldAbsorbResult
+{
+    public int Absorbed;
+    public int ThroughDamage;
+    public bool ShieldDepleted;
 }
 ```
 
