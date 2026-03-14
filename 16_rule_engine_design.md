@@ -234,6 +234,7 @@ MatchSetup → TurnStart → Draw → Preparation → Battle → TurnEnd
    - バースト状態
    - フィールド効果
    - 状態異常/バフ
+   - シールド
    - アイテム（持続ターン減少のみ）
    - ユニークCD / サポートCD
 2. createdSeq 昇順にソート
@@ -243,6 +244,7 @@ MatchSetup → TurnStart → Draw → Preparation → Battle → TurnEnd
       - 召喚: SummonObjectExpired / SummonUnitExpired
       - バースト状態: 解除（AP上限/召喚/ユニークを元に戻す）
       - フィールド効果: FieldEffectExpired
+      - シールド: ShieldExpired
       - 状態異常: StatusExpired
       - CD: cooldownRemainingTurns-- のみ（0で使用可能に戻る）
    c. 消滅で誘発トリガーが発生した場合、イベントキューへ積む
@@ -253,6 +255,30 @@ MatchSetup → TurnStart → Draw → Preparation → Battle → TurnEnd
 ```
 
 **イベント**: `PhaseChanged(TurnEnd)`, `TurnEnded`, 各種 Expired イベント
+
+#### 勝敗判定（VictoryCheck）
+
+勝敗判定は **バトルフェイズの全行動解決後** と **ターン終了時（maxTurns到達）** に行う。
+
+```
+CheckVictory(state, regulation):
+  1. 各チームの状態を判定:
+     a. victoryCondition == "allDown":
+        - チームの全キャラが isDown == true → そのチームは敗北
+     b. victoryCondition == "leaderDown":
+        - チームのリーダーが isDown == true → そのチームは敗北
+  2. 判定結果:
+     a. 片方だけ敗北条件を満たす → 他方の勝利
+     b. 両方同時に敗北条件を満たす → タイブレーク判定
+     c. どちらも満たさない + maxTurns 到達 → タイブレーク判定
+     d. どちらも満たさない + maxTurns 未到達 → 続行
+  3. タイブレーク判定（hpRatioSum）:
+     a. 各チームの hpRatioSum を算出:
+        hpRatioSum = Σ (isDown でないキャラの currentHp / maxHp)
+     b. hpRatioSum が高い方が勝利
+     c. 完全同値 → initiativeTeamId 側が勝利
+  4. GameEnd イベント発行（勝者/敗者/判定理由）
+```
 
 ---
 
@@ -861,6 +887,140 @@ DispelStatus(state, target, category, count):
 
 ---
 
+## 10.5. シールド処理
+
+### 概要
+
+シールドはダメージ吸収用の一時的な防御膜。`CharacterState.shield` にキャラごと最大1枠保持する。
+
+### 付与フロー
+
+```
+ApplyShield(state, targetId, shieldParams, context):
+  1. シールド量を算出:
+     - Fixed: value をそのまま使用
+     - MaxHpPercent: floor(target.maxHp * value)
+     - StatScale: floor(source の stat * value)
+  2. 既存シールドがある場合 → ShieldExpired(overwritten) イベント発行
+  3. 新規 ShieldInstance を生成:
+     - remainingAmount = 算出値
+     - remainingTurns = duration
+     - createdSeq = state.NextSeq()
+  4. target.shield = 新規 ShieldInstance
+  5. ShieldApplied イベント発行
+```
+
+### ダメージ吸収フロー
+
+DamageCalculator の計算結果をHPに適用する際、シールドによる吸収を挟む。
+
+```
+ApplyDamageWithShield(state, targetId, damage, damageType):
+  1. damageType == True → シールドを貫通（吸収なし）、HP に直接適用
+  2. target.shield == null → HP に直接適用
+  3. target.shield != null:
+     a. absorbed = min(shield.remainingAmount, damage)
+     b. shield.remainingAmount -= absorbed
+     c. throughDamage = damage - absorbed
+     d. target.hp -= throughDamage
+     e. ShieldConsumed イベント発行（absorbed, throughDamage）
+     f. shield.remainingAmount == 0 → shield を null に、ShieldExpired イベント発行
+```
+
+### 期限切れ
+
+- ターン終了時に `remainingTurns` を 1 減少（`createdSeq` 昇順、他の永続効果と統一）
+- 0 になったらシールド消滅 → `ShieldExpired` イベント発行
+
+---
+
+## 10.6. アイテム管理（ItemManager）
+
+### 概要
+
+アイテムカードはキャラにセットされ、トリガー条件が満たされると自動発動する。
+アイテム枠は **キャラごとに1枠**。
+
+### セットフロー
+
+```
+SetItem(state, characterId, itemCardDef, context):
+  1. 既存アイテムがある場合:
+     a. ItemOverwritten イベント発行（既存アイテムの除去）
+     b. 既存アイテムは graveyard へ移動
+  2. ItemInstance を生成:
+     - countRemaining = itemCardDef.count
+     - triggers = itemCardDef.triggers
+     - createdSeq = state.NextSeq()
+  3. character.item = 新規 ItemInstance
+  4. ItemSet イベント発行
+```
+
+### 自動発動フロー
+
+バトルフェイズ中、各イベント処理後にアイテムのトリガー条件をスキャンする（TriggerSystem と連携）。
+
+```
+CheckItemTriggers(state, evt):
+  1. 全キャラの item を走査
+  2. 各 item.triggers をイベントと照合
+  3. 条件成立:
+     a. ItemTriggered イベント発行
+     b. EffectResolver.ResolveEffect(itemCardDef.effect, context)
+     c. item.countRemaining -= 1
+     d. countRemaining == 0:
+        - item を null に
+        - カードを graveyard へ
+        - ItemExhausted イベント発行
+```
+
+### 上書きと破棄の区別
+
+| 状況 | イベント | カードの移動先 |
+|---|---|---|
+| 新アイテムで上書き | `ItemOverwritten` | graveyard |
+| 残回数 0 で破棄 | `ItemExhausted` | graveyard |
+
+- 上書きは「破棄」とは別扱い（将来「破棄時」誘発があっても上書きでは発火しない想定）
+
+---
+
+## 10.7. フィールド効果管理（FieldEffectManager）
+
+### 概要
+
+フィールド効果はチーム単位で保持される場の効果。各チーム1枠で、新規展開時は既存を上書きする。
+
+### 展開フロー
+
+```
+DeployFieldEffect(state, ownerTeamId, fieldEffectDef, context):
+  1. 既存フィールド効果がある場合:
+     a. FieldEffectOverwritten イベント発行
+     b. 既存を null に
+  2. FieldEffectInstance を生成:
+     - ownerTeamId, sourceTeamId = context から決定
+     - duration = fieldEffectDef.defaultDurationTurns
+     - modifiers = fieldEffectDef.modifiers
+     - triggers = fieldEffectDef.triggers
+     - createdSeq = state.NextSeq()
+  3. team.fieldEffect = 新規 FieldEffectInstance
+  4. FieldEffectDeployed イベント発行
+  5. modifiers がある場合 → StatCalculator で影響キャラのステータス再計算
+```
+
+### 期限切れ
+
+- ターン終了時に `remainingTurns` を 1 減少（`createdSeq` 昇順）
+- 0 になったら消滅 → `FieldEffectExpired` イベント発行 → ステータス再計算
+
+### 解除（dispel）
+
+- `purgeable` タグ付きのフィールド効果のみ dispel 可能
+- 解除時 → `FieldEffectRemoved` イベント発行 → ステータス再計算
+
+---
+
 ## 11. 乱数管理（RngProvider）
 
 ### 決定的 RNG
@@ -1053,6 +1213,79 @@ public class StatRecomputedEvent : GameEvent
     public List<AppliedEffect> AppliedEffects { get; set; }
     public int FinalValue { get; set; }
 }
+
+public class ShieldAppliedEvent : GameEvent
+{
+    public string TargetId { get; set; }
+    public string SourceId { get; set; }
+    public int Amount { get; set; }
+    public int Duration { get; set; }
+}
+
+public class ShieldConsumedEvent : GameEvent
+{
+    public string TargetId { get; set; }
+    public int Absorbed { get; set; }
+    public int ThroughDamage { get; set; }
+}
+
+public class ShieldExpiredEvent : GameEvent
+{
+    public string TargetId { get; set; }
+    public ShieldRemovalReason Reason { get; set; }
+}
+
+public class CharacterResurrectedEvent : GameEvent
+{
+    public string TargetId { get; set; }
+    public string SourceId { get; set; }
+    public int RestoredHp { get; set; }
+}
+
+public class ElementConvertedEvent : GameEvent
+{
+    public string CharacterId { get; set; }
+    public string FromElement { get; set; }
+    public string ToElement { get; set; }
+    public int Amount { get; set; }
+}
+
+public class APModifiedEvent : GameEvent
+{
+    public string CharacterId { get; set; }
+    public int Amount { get; set; }
+    public int ApBefore { get; set; }
+    public int ApAfter { get; set; }
+}
+
+public class ItemSetEvent : GameEvent
+{
+    public string CharacterId { get; set; }
+    public string ItemCardId { get; set; }
+}
+
+public class ItemTriggeredEvent : GameEvent
+{
+    public string CharacterId { get; set; }
+    public string ItemCardId { get; set; }
+    public string TriggerEvent { get; set; }
+    public int CountRemaining { get; set; }
+}
+
+public class ItemExhaustedEvent : GameEvent
+{
+    public string CharacterId { get; set; }
+    public string ItemCardId { get; set; }
+}
+
+public class ItemOverwrittenEvent : GameEvent
+{
+    public string CharacterId { get; set; }
+    public string OldItemCardId { get; set; }
+    public string NewItemCardId { get; set; }
+}
+
+public enum ShieldRemovalReason { Expired, Overwritten, Depleted }
 ```
 
 #### IRngProvider / SeededRng
@@ -1111,6 +1344,7 @@ public class TurnProcessor : ITurnProcessor
 {
     private readonly IDeckManager deckManager;
     private readonly IActionResolver actionResolver;
+    private readonly IEffectResolver effectResolver;
     private readonly IStatusEffectProcessor statusEffectProcessor;
     private readonly IBurstManager burstManager;
     private readonly ISummonManager summonManager;
@@ -1118,12 +1352,14 @@ public class TurnProcessor : ITurnProcessor
     public TurnProcessor(
         IDeckManager deckManager,
         IActionResolver actionResolver,
+        IEffectResolver effectResolver,
         IStatusEffectProcessor statusEffectProcessor,
         IBurstManager burstManager,
         ISummonManager summonManager)
     {
         this.deckManager = deckManager;
         this.actionResolver = actionResolver;
+        this.effectResolver = effectResolver;
         this.statusEffectProcessor = statusEffectProcessor;
         this.burstManager = burstManager;
         this.summonManager = summonManager;
@@ -1366,6 +1602,7 @@ public class CharacterState
     public SummonSlotState SummonSlot { get; set; }  // nullable
     public BurstState Burst { get; set; }
     public ElementCounters Elements { get; set; }
+    public ShieldInstance Shield { get; set; }  // nullable, max 1
 }
 
 public class CharacterStats
@@ -1680,8 +1917,33 @@ public class FieldEffectInstance
     public string InstanceId { get; set; }
     public string OwnerTeamId { get; set; }
     public string SourceTeamId { get; set; }
+    public string FieldEffectDefId { get; set; }
     public int CreatedSeq { get; set; }
     public int RemainingTurns { get; set; }  // -1 for infinite
+    public List<StatModifier> Modifiers { get; set; }
+    public List<CardTrigger> Triggers { get; set; }
+    public List<string> Tags { get; set; }
+}
+
+public class FieldEffectDefinition
+{
+    public string Id { get; set; }
+    public string Name { get; set; }
+    public int DefaultDurationTurns { get; set; }
+    public string Scope { get; set; }  // "ownTeam" / "enemyTeam" / "bothTeams"
+    public List<StatModifier> Modifiers { get; set; }
+    public List<CardTrigger> Triggers { get; set; }
+    public List<string> Tags { get; set; }
+    public string RulesText { get; set; }
+}
+
+public class ShieldInstance
+{
+    public string SourceId { get; set; }
+    public string SourceCharacterId { get; set; }
+    public int RemainingAmount { get; set; }
+    public int RemainingTurns { get; set; }
+    public int CreatedSeq { get; set; }
 }
 
 public class SupportSlotState
