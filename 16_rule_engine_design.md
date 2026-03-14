@@ -674,6 +674,86 @@ ResolveSetEffects(state, setEffects, context):
   3. 許可された EffectSpec を ResolveEffect() で解決
 ```
 
+### 複数対象の解決
+
+`TargetSpec.mode` が `allAllies` / `allEnemies` など複数対象を指す場合の処理:
+
+```
+ResolveMultiTarget(state, effect, context, targets):
+  1. 対象リストを生成:
+     - allAllies → 味方チームの isDown==false の全キャラ
+     - allEnemies → 敵チームの isDown==false の全キャラ
+     - random → RngProvider で isDown==false のキャラから1体選択
+  2. 対象リストを createdSeq 昇順でソート（処理順の決定性保証）
+  3. 各対象について:
+     - effect のコピーに target = { mode: 特定キャラ, targetIds: [id] } を設定
+     - ResolveEffect(state, copiedEffect, context) を呼び出し
+  4. 途中で対象がダウンしても残りの対象への効果は継続する
+```
+
+- Composite 内の子効果が allEnemies を持つ場合、**子効果ごとに** 全対象を処理する（親の対象を共有しない）
+- ダメージ効果で `hitCount > 1` の場合、**同一対象に** hitCount 回ダメージ判定を繰り返す
+
+### 蘇生処理（Resurrect）
+
+```
+ResolveResurrect(state, targetId, params, context):
+  1. 対象チェック:
+     - target.isDown == false → 効果なし（既に生存）
+     - target.isDown == true → 蘇生処理に進む
+  2. 蘇生実行:
+     a. target.isDown = false
+     b. target.hp = max(1, floor(target.maxHp * params.hpPercent))
+     c. target.shield = null（シールドはリセット）
+     d. target.statuses は維持（蘇生前の状態異常/バフを引き継ぐ）
+     e. target.ap は変更なし（蘇生前の値を維持）
+  3. CharacterResurrected イベント発行
+  4. StatCalculator で蘇生キャラのステータス再計算
+```
+
+注意事項:
+- 蘇生はカード効果として **制限なし** で許可（`01_core_rules.md` 確定済み）
+- 勝敗判定は **バトルフェイズの全行動解決後** に行うため、蘇生で覆る
+- 蘇生対象の `target` 指定は `allyCharacter`（ダウン済み味方を指定可能にする必要あり）
+  - TargetSpec の `allyCharacter` は **ダウン済みキャラも対象候補に含む**（Resurrect 専用の例外）
+  - Resurrect 以外の効果で TargetSpec がダウン済みキャラを指す場合、その効果は無効
+
+### ダメージ適用フロー（DamageCalculator → ShieldProcessor → HP）
+
+DamageCalculator が算出した最終ダメージを HP に適用するまでの統合フロー:
+
+```
+ApplyDamageToTarget(state, targetId, attackContext):
+  1. DamageCalculator.CalculateDamage(attackContext)
+     → DamageResult { finalDamage, isCritical, rawDamage }
+
+  2. ダメージ種別分岐:
+     a. DamageType == True（真ダメージ）:
+        - シールド貫通: target.hp -= finalDamage
+        - ShieldProcessor は呼ばない
+     b. DamageType == Physical or Magical:
+        - ShieldProcessor.AbsorbDamage(state, targetId, finalDamage, damageType)
+        → ShieldAbsorbResult { absorbed, throughDamage, shieldDepleted }
+        - target.hp -= throughDamage
+
+  3. HP 下限: target.hp = max(0, target.hp)
+
+  4. ダウン判定:
+     target.hp == 0 → target.isDown = true → CharacterDowned イベント発行
+
+  5. DamageDealt イベント発行:
+     - amount = finalDamage
+     - absorbed = shieldAbsorbed（0 if 真ダメージ）
+     - isCritical
+     - damageType
+
+  6. 召喚ユニット経由のダメージ（03_summons.md）:
+     対象が召喚ユニットを持つキャラの場合、攻撃は召喚ユニットへ差し替わる:
+     a. 召喚ユニットに finalDamage を適用
+     b. 紐づくキャラに floor(finalDamage / 2) の真ダメージ（半減ダメージ）
+     c. 召喚ユニットの hp == 0 → SummonUnitExpired イベント
+```
+
 ---
 
 ## 7. 召喚管理（SummonManager）
@@ -2604,7 +2684,8 @@ public enum TargetMode
     Self, AllyCharacter, EnemyCharacter,
     AllySummonUnit, EnemySummonUnit,
     AllySummonObject, EnemySummonObject,
-    AllAllies, AllEnemies, Random
+    AllAllies, AllEnemies, Random,
+    AllyDowned  // 蘇生専用: ダウン済み味方キャラを対象
 }
 
 public class ScalingSpec
