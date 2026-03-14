@@ -90,6 +90,7 @@ C# 実装の全体像を定義する。
 | **ItemManager** | アイテムのセット/自動発動/破棄/上書き |
 | **FieldEffectManager** | フィールド効果の展開/消滅/上書き |
 | **ShieldProcessor** | シールドの付与/ダメージ吸収/期限切れ |
+| **LoadoutValidator** | 編成バリデーション（RegulationDefinition 準拠） |
 | **RngProvider** | 決定的乱数生成（seedベース） |
 
 ### 依存関係
@@ -1033,6 +1034,288 @@ DeployFieldEffect(state, ownerTeamId, fieldEffectDef, context):
 
 - `purgeable` タグ付きのフィールド効果のみ dispel 可能
 - 解除時 → `FieldEffectRemoved` イベント発行 → ステータス再計算
+
+---
+
+## 10.8. トリガー判定処理（TriggerSystem）
+
+### 責務
+
+イベント発生時にゲーム中の全トリガーソースをスキャンし、条件が成立したトリガーを収集・実行する。
+セクション3（イベントシステム）で概要を記載したが、ここでは処理ロジックの詳細を定義する。
+
+### トリガーソース一覧
+
+| ソース | 保持場所 | フェイズ | 備考 |
+|---|---|---|---|
+| **アイテム** | `CharacterState.item.triggers` | 全フェイズ | 条件成立で自動発動。ItemManager と連携 |
+| **キャラパッシブ** | `CharacterState.passives` | 全フェイズ | `isActive == true` のもののみ |
+| **状態異常/バフ** | `StatusEffect.triggers` | 全フェイズ | 誘発型の状態効果 |
+| **フィールド効果** | `FieldEffectInstance.triggers` | 全フェイズ | 誘発型のフィールド効果 |
+| **予約済みカード** | `PlannedAction` の `CardTrigger` | バトルフェイズのみ | 割り込み早期発動 |
+
+### スキャンフロー
+
+```
+ScanTriggers(state, evt):
+  1. triggeredActions = []
+  2. triggerCounters を参照（無限ループ対策）
+
+  ── アイテムトリガー ──
+  3. 全キャラの item を走査:
+     item != null && item.triggers がイベント evt に一致
+     → triggerCounters[item.instanceId] < 10 を確認
+     → 一致: { source: "item", entityId, action } を triggeredActions に追加
+
+  ── パッシブトリガー ──
+  4. 全キャラの passives を走査:
+     passive.isActive == true && passive に誘発条件がある && evt に一致
+     → 一致: { source: "passive", entityId, action } を追加
+
+  ── 状態異常/バフトリガー ──
+  5. 全キャラの statuses を走査:
+     status.triggers が evt に一致
+     → 一致: { source: "status", entityId, action } を追加
+
+  ── フィールド効果トリガー ──
+  6. 両チームの fieldEffect を走査:
+     fieldEffect != null && fieldEffect.triggers が evt に一致
+     → 一致: { source: "fieldEffect", entityId, action } を追加
+
+  ── 予約済みカードトリガー（バトルフェイズのみ） ──
+  7. state.currentPhase == Battle の場合:
+     未解決の PlannedAction で CardTrigger を持つものを走査:
+     trigger.event が evt に一致 && trigger.condition を評価
+     → 一致: { source: "cardTrigger", entityId, action } を追加
+
+  8. return triggeredActions
+```
+
+### トリガー条件マッチング
+
+```
+MatchTriggerCondition(trigger, evt):
+  1. trigger.event と evt の型を照合:
+     - "onDamaged" → evt is DamageDealtEvent && target == trigger所有者
+     - "onAllyDamaged" → evt is DamageDealtEvent && target は味方キャラ
+     - "onEnemyAction" → evt is ActionResolvedEvent && actor は敵チーム
+     - "onAllyHpBelow" → evt is DamageDealtEvent && 味方の hp/maxHp < threshold
+     - "onEnemySummon" → evt is SummonEnteredEvent && 敵チーム
+     - "onTurnStart" → evt is TurnStartedEvent
+     - "onTurnEnd" → evt is TurnEndedEvent
+     - etc.
+  2. trigger.condition が存在する場合:
+     - 条件文字列を評価（例: "damageAmount >= 100"）
+     - Phase 1 では固定パターンのパーサーで対応
+       サポートする条件パターン:
+       - "damageAmount >= N"
+       - "hpPercent <= N"
+       - "elementCount(color) >= N"
+     - 条件不成立 → false
+  3. 全条件成立 → true
+```
+
+### 割り込み解決フロー（予約済みカードトリガー）
+
+```
+ResolveInterrupt(state, triggeredCardActions):
+  1. 複数のトリガーが同時成立した場合:
+     a. イニシアチブ側のトリガーを先に処理
+     b. 同一チーム内で複数 → 所有者が解決順を選択
+        （Phase 1 では createdSeq 昇順で自動決定）
+  2. 各トリガーカードについて:
+     a. 不発チェック（AP不足等）
+     b. AP消費
+     c. EffectResolver.ResolveEffect(cardDef.effect, context{activationMode: Interrupt})
+     d. カードを graveyard へ
+     e. ActionResolved(executed, interrupt) イベント発行
+     f. 該当カードを予約リストから除外（以後の priority 解決に参加しない）
+  3. 割り込み解決後、通常の行動解決を再開
+```
+
+### 無限ループ対策の実装
+
+```csharp
+public class TriggerCounterMap
+{
+    private readonly Dictionary<string, int> counters = new();
+    private const int MaxTriggersPerEntity = 10;
+
+    public bool CanTrigger(string entityId)
+        => !counters.ContainsKey(entityId) || counters[entityId] < MaxTriggersPerEntity;
+
+    public void Increment(string entityId)
+    {
+        if (!counters.ContainsKey(entityId)) counters[entityId] = 0;
+        counters[entityId]++;
+    }
+
+    public void ResetAll() => counters.Clear();
+}
+```
+
+- `TriggerCounterMap` はフェイズ開始時に `ResetAll()` で初期化
+- 各トリガー発動時に `Increment()` で加算
+- `CanTrigger()` が false なら、そのエンティティからの誘発は無視
+
+---
+
+## 10.9. 編成バリデーション（LoadoutValidator）
+
+### 責務
+
+MatchSetup 時に、両チームの編成が `RegulationDefinition` のルールに適合しているかを検証する。
+不正な編成はマッチ開始前にリジェクトする。
+
+### バリデーションチェック一覧
+
+```
+ValidateLoadout(teamConfig, regulation):
+  errors = []
+
+  ── 1. チーム人数 ──
+  teamConfig.characters.length == regulation.teamSize
+  → 不一致: "チーム人数が不正（期待: {teamSize}, 実際: {actual}）"
+
+  ── 2. キャラデッキ枚数 ──
+  各キャラの deckCardIds.length が regulation.characterDeckSize の [min, max] 範囲内
+  → 範囲外: "キャラ {id} のデッキ枚数が不正（{min}〜{max}枚）"
+
+  ── 3. サポート枠数 ──
+  teamConfig.supportCardIds.length <= regulation.supportSetMax
+  → 超過: "サポート枚数が上限超過（最大: {max}）"
+
+  ── 4. 同名カード制限 ──
+  4a. perCharacterDeck: 各キャラデッキ内で同名カードが regulation.sameNameRule.perCharacterDeck 枚以下
+  4b. perTeam: チーム全体（全キャラデッキ + サポート）で同名カードが perTeam 枚以下
+  → 超過: "カード {name} が同名制限を超過"
+
+  ── 5. 色制約 ──
+  5a. mode == "maxColors":
+      チーム全体で使用している有色カードの色数 <= regulation.colorRestriction.maxColors
+      ※ 無色カードは色数にカウントしない
+  5b. mode == "singleOnly":
+      有色カードは1色のみ許可
+  → 違反: "色制約違反（最大 {maxColors} 色）"
+
+  ── 6. 無色カード制限 ──
+  6a. mode == "ratio":
+      各キャラデッキ内の無色カード枚数 / デッキ枚数 <= maxRatio
+  6b. mode == "fixed":
+      各キャラデッキ内の無色カード枚数 <= maxCount
+  → 超過: "無色カード制限超過"
+
+  ── 7. 禁止/制限カード ──
+  7a. regulation.bannedCards に含まれるカードが使用されていないか
+  7b. regulation.restrictedCards の枚数制限が守られているか
+  → 違反: "禁止カード {id} が使用されている" / "制限カード {id} が枚数超過"
+
+  ── 8. ユニークカードの妥当性 ──
+  各キャラが選択したユニークカードが、そのキャラの候補3枚に含まれるか
+  → 不正: "キャラ {id} のユニーク {uniqueId} は候補に含まれない"
+
+  return errors（空なら合格）
+```
+
+### バリデーション結果
+
+```csharp
+public class LoadoutValidationResult
+{
+    public bool IsValid => Errors.Count == 0;
+    public List<string> Errors { get; set; } = new();
+}
+```
+
+### MatchSetup での呼び出し
+
+MatchSetup のステップ1（基盤初期化）の直後、ステップ2（チーム構築）の前に実行する。
+
+```
+InitializeMatch(config):
+  1a. GameState 生成
+  1b. バリデーション:
+      result1 = ValidateLoadout(config.team1, config.regulation)
+      result2 = ValidateLoadout(config.team2, config.regulation)
+      → いずれかが不正 → MatchSetupFailed エラーを返す
+  2. チーム構築（以降は既存フロー）
+```
+
+---
+
+## 10.10. Phase 1 実装ロードマップ
+
+### 目的
+
+Phase 1（ルールエンジン実装）のモジュール実装順序を定義する。
+依存関係の少ない下位モジュールから積み上げ、各ステップで単体テストを書きながら進める。
+
+### 実装順序
+
+```
+Step 1: 基盤層（依存なし）
+├── RngProvider（SeededRng）
+├── EventQueue
+├── GameState / TeamState / CharacterState 等のデータモデル
+└── 各種 enum / 定数定義
+    テスト: RNG の決定性, EventQueue の FIFO 動作
+
+Step 2: 計算層（基盤に依存）
+├── StatCalculator（5段階パイプライン）
+├── DamageCalculator（基本式 + クリティカル + 状態異常命中）
+└── ShieldProcessor（付与 / 吸収 / 期限切れ）
+    テスト: ステータス計算の精度, ダメージ計算の境界値, シールド吸収
+
+Step 3: 状態管理層
+├── StatusEffectProcessor（付与 / 解除 / 期限切れ / DoT）
+├── DeckManager（ドロー / 再構築 / ゾーン移動）
+└── LoadoutValidator（編成バリデーション）
+    テスト: 重ねがけルール, デッキ再構築の決定性, バリデーション全パターン
+
+Step 4: エンティティ管理層
+├── SummonManager（生成 / 消滅 / 上書き / バースト変化）
+├── BurstManager（ゲージ管理 / バースト状態適用・解除）
+├── ItemManager（セット / 自動発動 / 破棄）
+└── FieldEffectManager（展開 / 消滅 / 上書き）
+    テスト: 召喚入れ替え, バースト状態遷移, アイテム自動発動
+
+Step 5: 効果解決層
+├── EffectResolver（17種の EffectType ディスパッチ）
+│   ├── 単純型（Damage, Heal, Draw, StatusApply, Dispel, etc.）を先に
+│   └── 再帰型（Composite, Conditional）を後に
+└── TriggerSystem（スキャン / 条件マッチ / 割り込み解決）
+    テスト: 各 EffectType の解決, Composite 再帰, Conditional 分岐,
+           トリガー割り込み, 無限ループ対策
+
+Step 6: オーケストレーション層
+├── ActionResolver（ソート / 不発判定 / 順次解決）
+├── TurnProcessor（フェイズ遷移 / 各フェイズ処理）
+└── GameManager（MatchSetup / ターンループ / 勝敗判定）
+    テスト: 行動ソートの全タイブレーク, 不発パターン,
+           1ターン通しテスト, 複数ターン通しテスト,
+           勝敗判定（allDown / timeout / 蘇生後）
+
+Step 7: 統合テスト
+├── フルマッチシミュレーション（3〜5ターン）
+├── リプレイ再現テスト（同一 seed → 同一結果）
+├── エッジケース:
+│   ├── 全キャラ同時ダウン → タイブレーク
+│   ├── 蘇生後の勝敗再判定
+│   ├── デッキ再構築を跨ぐドロー
+│   ├── Composite 内で対象ダウン → 後続効果の処理
+│   └── 同一イベントで複数トリガー同時成立
+└── パフォーマンス: 15ターンフルマッチの処理時間計測
+```
+
+### テスト方針
+
+| 方針 | 内容 |
+|---|---|
+| **純粋関数テスト** | 各モジュールは GameState を受け取り変更後を返す。入出力で検証 |
+| **決定的テスト** | RngProvider の seed 固定で乱数依存テストも決定的に |
+| **インターフェース経由** | モック差し替えで単体テストを独立実行可能 |
+| **イベントログ検証** | 処理後の EventQueue に期待するイベント列が記録されているかで検証 |
+| **スナップショット比較** | GameState のディープコピーで処理前後の差分を検証 |
 
 ---
 
@@ -2003,6 +2286,49 @@ public struct ShieldAbsorbResult
     public int Absorbed;
     public int ThroughDamage;
     public bool ShieldDepleted;
+}
+```
+
+#### ITriggerSystem / TriggerSystem（詳細）
+
+```csharp
+public interface ITriggerSystem
+{
+    /// <summary>イベントに対してトリガー条件をスキャンし、発動対象を返す</summary>
+    List<TriggeredAction> ScanTriggers(GameState state, GameEvent evt);
+
+    /// <summary>トリガー条件をイベントと照合する</summary>
+    bool MatchTriggerCondition(CardTrigger trigger, GameEvent evt, GameState state);
+
+    /// <summary>無限ループ対策用の誘発カウンタを管理</summary>
+    bool CanTrigger(string entityId);
+
+    /// <summary>フェイズ開始時にカウンタをリセット</summary>
+    void ResetCounters();
+}
+
+public class TriggeredAction
+{
+    public string EntityId { get; set; }
+    public string SourceType { get; set; }  // "item" / "passive" / "status" / "fieldEffect" / "cardTrigger"
+    public string CardId { get; set; }
+    public PlannedAction Action { get; set; }  // cardTrigger の場合のみ
+}
+```
+
+#### ILoadoutValidator
+
+```csharp
+public interface ILoadoutValidator
+{
+    /// <summary>編成がレギュレーションに適合しているか検証する</summary>
+    LoadoutValidationResult Validate(TeamConfig teamConfig, RegulationDefinition regulation);
+}
+
+public class LoadoutValidationResult
+{
+    public bool IsValid => Errors.Count == 0;
+    public List<string> Errors { get; set; } = new();
 }
 ```
 
