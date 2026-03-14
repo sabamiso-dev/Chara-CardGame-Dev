@@ -15,7 +15,7 @@
 | 04_colors.md | 属性・色システム |
 | 05_burst_and_support.md | バースト・サポートシステム |
 | 06_turn_flow.md | ターン進行フロー |
-| 07_data_model.md | データモデル・イベント定義 |
+| 07_data_model.md | データモデル・イベント定義・EffectSpec・ShieldInstance・FieldEffectDefinition |
 | 08_nonfunctional_and_milestones.md | 非機能要件・マイルストーン |
 | 09_open_questions.md | 未決事項（TBD集約先） |
 | 10_team_and_3v3_battle.md | チーム戦・3vs3ルール |
@@ -24,7 +24,7 @@
 | 13_github_and_claude_workflow.md | GitHub・Claude連携ワークフロー |
 | 14_content_baselines_and_data_workflow.md | コンテンツ基準値・データ投入手順 |
 | 15_damage_formula.md | ダメージ計算式 |
-| 16_rule_engine_design.md | ルールエンジン設計（Phase 1 実装の設計図） |
+| 16_rule_engine_design.md | ルールエンジン設計（Phase 1 実装の設計図・全22セクション・C#クラス設計含む） |
 
 ## 仕様変更ルール
 - 仕様変更時は関連ドキュメントの整合性を同時に取る

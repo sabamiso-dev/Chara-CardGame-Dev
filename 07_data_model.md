@@ -227,8 +227,13 @@
 - `flat`:  { pAtk?: number; pDef?: number; mAtk?: number; mDef?: number; hp?: number; spd?: number; tech?: number }
 
 ### TargetSpec（例）
-- `mode`: `self | allyCharacter | enemyCharacter | allySummonUnit | enemySummonUnit | allySummonObject | enemySummonObject | allAllies | allEnemies | random`
+- `mode`: `self | allyCharacter | enemyCharacter | allySummonUnit | enemySummonUnit | allySummonObject | enemySummonObject | allAllies | allEnemies | random | allyDowned`
 - `targetIds`: string[]（必要な場合）
+
+（補足）
+- `allyDowned`：ダウン済みの味方キャラを対象にする（蘇生専用）。Resurrect 以外の EffectType でこのモードを使用した場合、効果は無効となる。
+- `allAllies` / `allEnemies`：対象は `isDown == false` のキャラのみ（ダウン済みを含まない）。
+- `random`：`isDown == false` のキャラから RngProvider で1体選択。
 
 ### FieldEffectInstance（チームのフィールド効果）
 カード効果などで「チーム全体に恩恵」「相手チームに不利」を与えるための、**バトル中にチーム単位で保持される効果**。
