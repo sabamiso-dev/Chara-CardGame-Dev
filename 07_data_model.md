@@ -47,6 +47,7 @@
 - `summonSlot`: SummonSlotState | null（キャラに紐づく召喚枠：召喚オブジェクト＋召喚ユニット）
 - `burst`: BurstState
 - `elements`: ElementCounters
+- `shield`: ShieldInstance | null（シールド。最大1枠。新規付与時は既存を上書き）
 
 ### CharacterStats（最小）
 - `pAtk`, `pDef`
@@ -248,6 +249,42 @@
 - 新規展開時は `TeamState.fieldEffect` を丸ごと差し替える（旧フィールド効果は **消滅（上書き）** 扱い）
 - 期限切れ（duration==0）・解除（dispel等）・上書きは、**除去理由として区別**できるようにイベントログも分ける（下記 `Event` 参照）
 - 除去後は `null` へ
+
+### FieldEffectDefinition（フィールド効果の定義テンプレート）
+フィールド効果をデータ駆動で定義するためのテンプレート。`FieldEffectInstance` の生成元となる。
+
+- `id`: string（例：`field_flame_zone`）
+- `name`: string（例：「炎域」）
+- `defaultDurationTurns`: number（デフォルト持続ターン数。-1 で無限）
+- `scope`: `"ownTeam" | "enemyTeam" | "bothTeams"`（効果の適用範囲）
+- `modifiers`: StatModifier[]（ステータス修正。StatCalculator パイプラインに参加）
+- `triggers`: TriggerSpec[]（誘発型効果がある場合）
+- `tags`: string[]（dispel 対象判定などに使用。標準タグ：`purgeable`）
+- `rulesText`: string
+
+### ShieldInstance（キャラのシールド状態）
+ダメージを肩代わりする一時的な防御膜。**キャラごとに最大1枠**。新規付与時は既存を上書きする。
+
+- `sourceId`: string（付与元カード/効果の ID）
+- `sourceCharacterId`: string（付与元キャラ）
+- `remainingAmount`: number（残りシールド量。ダメージ吸収で減少）
+- `remainingTurns`: number（残り持続ターン数。ターン終了時に減少）
+- `createdSeq`: number（ターン終了処理順の決定に使用）
+
+（ルール）
+- ダメージ処理時、DEF計算後・HP減少前にシールドで吸収する
+- `remainingAmount` がダメージ以上 → シールドだけ減少、HP変動なし
+- `remainingAmount` がダメージ未満 → シールドを全消費し、超過分をHPから減算
+- **真ダメージはシールドを貫通する**（`15_damage_formula.md` 準拠）
+- `remainingAmount == 0` または `remainingTurns == 0` で消滅
+- 新規シールド付与時、既存シールドは **上書き（消滅）** される（加算ではない）
+
+### ItemCardDefinition（アイテムカードの定義）
+アイテムカード固有の定義。キャラにセットされ、トリガー条件で自動発動する。
+
+- `count`: number（使用回数。例：3）
+- `triggers`: CardTrigger[]（自動発動のトリガー条件）
+- `effect`: EffectSpec（発動時の効果）
 
 ---
 
@@ -529,7 +566,16 @@
 - `CharacterDowned`
 - `DamageDealt`, `Healed`
 - `StatusApplied`, `StatusExpired`
-- `ElementGained`, `ElementConsumed`
+- `ElementGained`, `ElementConsumed`, `ElementConverted`
+- `ShieldApplied`（シールド付与）
+- `ShieldConsumed`（シールドがダメージを吸収した）
+- `ShieldExpired`（シールドが期限切れで消滅した）
+- `CharacterResurrected`（蘇生）
+- `ItemSet`（アイテムがキャラにセットされた）
+- `ItemTriggered`（アイテムが自動発動した）
+- `ItemExhausted`（アイテムの残回数が0になり破棄された）
+- `ItemOverwritten`（アイテムが上書きで除去された）
+- `APModified`（AP増減）
 - `DeckReshuffledFromTrash`（詳細は下記）
 - `ActionResolved`（詳細は下記）
 - `StatRecomputed`（詳細は下記。セクション5参照）
