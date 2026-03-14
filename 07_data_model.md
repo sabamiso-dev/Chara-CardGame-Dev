@@ -326,6 +326,190 @@
 
 ---
 
+## 2.5) カード効果定義（EffectSpec）
+
+カード効果をデータ駆動で表現する共通フレームワーク。
+`StatusEffectType` と同じ **判別共用体パターン**（`EffectType` enum + 型別パラメータクラス）を採用し、
+継承階層ではなく flat な構成にすることで JSON / ScriptableObject シリアライズに最適化する。
+
+### EffectType（効果種別 enum）
+
+| EffectType | 用途 | 代表例 |
+|---|---|---|
+| `Damage` | ダメージ（物理/魔法/真） | 攻撃スキル |
+| `Heal` | 回復（固定/割合/スケーリング） | 回復スキル |
+| `Draw` | カードドロー | ドロー系スキル |
+| `StatusApply` | 状態付与（バフ/デバフ/DoT） | 毒付与、攻撃UP |
+| `Dispel` | 状態解除（タグベース） | 解除スキル |
+| `Summon` | 召喚の参照（SummonManager へ委譲） | 召喚カード |
+| `ElementGain` | エレメント獲得 | エレメント蓄積 |
+| `ElementConsume` | エレメント消費 | エレメント消費型スキル |
+| `ElementConvert` | エレメント変換 | 橙の色変換 |
+| `BurstGain` | バーストポイント増加 | バースト蓄積 |
+| `Shield` | シールド付与 | 防御スキル |
+| `Resurrect` | 蘇生 | 蘇生スキル |
+| `FieldEffectDeploy` | フィールド効果展開 | フィールドスキル |
+| `ItemSet` | アイテムセット | アイテムカード |
+| `APModify` | AP 増減 | AP回復スキル |
+| `Composite` | 複合効果（子 EffectSpec のリスト） | ダメージ+デバフ |
+| `Conditional` | 条件分岐（条件→Then/Else） | エレメント≥3で追加ダメージ |
+
+### EffectSpec（効果定義の本体）
+
+- `effectType`: EffectType（上記 enum）
+- `target?`: TargetSpec（対象指定。省略時は発動元カードの target を継承）
+- `params`: 型別パラメータ（EffectType に応じて以下の1つを使用）
+
+### 型別パラメータクラス
+
+#### DamageEffectParams（Damage）
+- `damageType`: `"physical" | "magical" | "true"`
+- `cardMultiplier`: number（カード倍率。例：1.2）
+- `fixedDamage?`: number（真ダメージ固定値。`damageType=true` かつ倍率ではない場合）
+- `hitCount?`: number（多段ヒット数。省略時=1）
+- `atkStat?`: `"pAtk" | "mAtk"`（参照する攻撃ステータス。`damageType` から自動判定可。真ダメージで倍率参照時に使用）
+
+#### HealEffectParams（Heal）
+- `calcMode`: HealCalcMode（下記 enum）
+- `value`: number（固定値 or パーセント値 or 倍率）
+- `stat?`: `"pAtk" | "mAtk" | "pDef" | "mDef" | "tech"`（`calcMode=statScale` 時に参照するステータス）
+
+#### HealCalcMode（enum）
+- `fixed`：固定値回復（value がそのまま回復量）
+- `maxHpPercent`：最大HPの割合回復（value=0.1 → maxHP×10%）
+- `statScale`：ステータス×倍率で回復（value=0.5, stat=mAtk → mAtk×0.5）
+
+#### DrawEffectParams（Draw）
+- `count`: number（ドロー枚数）
+
+#### StatusApplyEffectParams（StatusApply）
+- `statusId`: string（StatusEffectDefinition の id を参照。例：`status_poison`）
+- `duration?`: number（省略時は StatusEffectDefinition の defaultDuration）
+- `overrideValue?`: number（効果量を上書きする場合。省略時は定義のデフォルト）
+- `stacks?`: number（一度に付与するスタック数。省略時=1）
+
+#### DispelEffectParams（Dispel）
+- `category`: `"buff" | "debuff" | "any"`
+- `count`: number（解除件数）
+- `filterTags?`: string[]（特定タグのみ対象。省略時は `purgeable` 全般）
+
+#### SummonEffectParams（Summon）
+- `summonCardId`: string（召喚カード定義の ID。SummonManager へ委譲）
+
+#### ElementGainEffectParams（ElementGain）
+- `element`: `"red" | "blue" | "green" | "orange" | "yellow" | "purple"`
+- `amount`: number
+
+#### ElementConsumeEffectParams（ElementConsume）
+- `element`: `"red" | "blue" | "green" | "orange" | "yellow" | "purple"`
+- `amount`: number
+
+#### ElementConvertEffectParams（ElementConvert）
+- `from`: `"red" | "blue" | "green" | "orange" | "yellow" | "purple"`
+- `to`: `"red" | "blue" | "green" | "orange" | "yellow" | "purple"`
+- `amount`: number
+
+#### BurstGainEffectParams（BurstGain）
+- `points`: number（バーストポイント増加量）
+
+#### ShieldEffectParams（Shield）
+- `shieldType`: ShieldType（下記 enum）
+- `value`: number（シールド量。固定値 or 倍率）
+- `duration?`: number（持続ターン数。省略時=1）
+- `stat?`: string（`shieldType=statScale` 時に参照するステータス）
+
+#### ShieldType（enum）
+- `fixed`：固定値シールド
+- `maxHpPercent`：最大HPの割合
+- `statScale`：ステータス×倍率
+
+#### ResurrectEffectParams（Resurrect）
+- `hpPercent`: number（蘇生時のHP割合。例：0.3 → maxHP×30%）
+
+#### FieldEffectDeployEffectParams（FieldEffectDeploy）
+- `fieldEffectId`: string（展開するフィールド効果の定義 ID）
+- `durationTurns`: number（持続ターン数。-1 で無限）
+
+#### ItemSetEffectParams（ItemSet）
+- `itemCardId`: string（セットするアイテムカードの定義 ID）
+
+#### APModifyEffectParams（APModify）
+- `amount`: number（正で回復、負で減少）
+- `targetStat`: `"current" | "unlockedMax"`（現在AP or 解放済み最大AP）
+
+#### CompositeEffectParams（Composite）
+- `children`: EffectSpec[]（子効果のリスト。順次解決）
+
+#### ConditionalEffectParams（Conditional）
+- `condition`: ConditionSpec（条件判定。下記参照）
+- `thenEffect`: EffectSpec（条件成立時に実行する効果）
+- `elseEffect?`: EffectSpec（条件不成立時に実行する効果。省略可）
+
+### ConditionSpec（条件定義）
+
+- `conditionType`: ConditionType（下記 enum）
+- `params`: 条件別パラメータ
+
+#### ConditionType（enum）
+
+| ConditionType | 用途 | 例 |
+|---|---|---|
+| `ElementThreshold` | エレメント数の閾値判定 | 赤エレメント≥3 |
+| `HpThreshold` | HP割合の閾値判定 | HP≤50% |
+| `StatusCheck` | 特定状態の有無判定 | 対象が毒状態か |
+| `BurstCheck` | バースト状態判定 | 自分がバースト中か |
+| `AllyDownCount` | 味方ダウン数判定 | 味方が2体以上ダウン |
+| `HandCount` | 手札枚数判定 | 手札≤2枚 |
+
+#### ElementThresholdParams
+- `element`: `"red" | "blue" | "green" | "orange" | "yellow" | "purple"`
+- `operator`: `"gte" | "lte" | "eq"`（以上/以下/等しい）
+- `threshold`: number
+
+#### HpThresholdParams
+- `scope`: `"self" | "target"`（判定対象。自分 or 効果対象）
+- `operator`: `"gte" | "lte"`
+- `thresholdPercent`: number（例：0.5 → 50%）
+
+#### StatusCheckParams
+- `scope`: `"self" | "target"`
+- `statusId?`: string（特定状態 ID。省略時はタグで判定）
+- `filterTags?`: string[]（タグベース判定）
+- `exists`: boolean（true=存在する場合に成立、false=存在しない場合に成立）
+
+#### BurstCheckParams
+- `scope`: `"self" | "target"`
+- `isBurst`: boolean
+
+#### AllyDownCountParams
+- `operator`: `"gte" | "lte" | "eq"`
+- `count`: number
+
+#### HandCountParams
+- `operator`: `"gte" | "lte" | "eq"`
+- `count`: number
+
+### セット効果（SetEffects）で使用可能な EffectType の制約
+
+セット効果（構築時パッシブ）は **バトル開始前に適用される** ため、バトル中の対象指定やリアルタイム効果を使用できない。
+
+#### 許可される EffectType
+| EffectType | 用途例 |
+|---|---|
+| `StatusApply` | 恒常ステ補正（永続 statMod バフ/デバフ） |
+| `Draw` | ゲーム開始時に追加ドロー |
+| `BurstGain` | 初期バーストポイント付与 |
+| `ElementGain` | 初期エレメント付与 |
+| `APModify` | 初期AP補正 |
+| `Composite` | 上記の複合（例：ステ補正+追加ドロー） |
+| `Conditional` | 条件付きセット効果（例：特定色デッキの場合のみ発動） |
+
+#### 禁止される EffectType
+- `Damage`, `Heal`, `Dispel`, `Summon`, `ElementConsume`, `ElementConvert`, `Shield`, `Resurrect`, `FieldEffectDeploy`, `ItemSet`
+  - 理由：これらはバトル中の対象指定・リアルタイム効果を前提としており、構築時パッシブとして適用する意味がない。
+
+---
+
 ## 3) イベント（Event）モデル（案）
 
 ### 代表イベント
