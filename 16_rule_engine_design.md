@@ -45,11 +45,17 @@ C# 実装の全体像を定義する。
 │  │ 計算)    │ │ ライン)      │ │ 判定/割込)│           │
 │  └──────────┘ └──────────────┘ └───────────┘           │
 │                                                         │
-│  ┌──────────┐ ┌──────────────┐ ┌───────────┐           │
-│  │SummonMgr │ │BurstManager  │ │RngProvider│           │
-│  │(生成/消滅│ │(ゲージ管理/  │ │(決定的   │           │
-│  │ /上書き) │ │ バースト状態)│ │ 乱数生成)│           │
-│  └──────────┘ └──────────────┘ └───────────┘           │
+│  ┌──────────────┐ ┌──────────┐ ┌───────────┐           │
+│  │EffectResolver│ │SummonMgr │ │BurstManager│          │
+│  │(EffectSpec   │ │(生成/消滅│ │(ゲージ管理/│          │
+│  │ ディスパッチ)│ │ /上書き) │ │ バースト)  │          │
+│  └──────────────┘ └──────────┘ └───────────┘           │
+│                                                         │
+│  ┌───────────┐                                          │
+│  │RngProvider│                                          │
+│  │(決定的   │                                          │
+│  │ 乱数生成)│                                          │
+│  └───────────┘                                          │
 └─────────────────────────────────────────────────────────┘
                │
                ▼
@@ -69,6 +75,7 @@ C# 実装の全体像を定義する。
 | **StatCalculator** | ステータス修正パイプライン（5段階） |
 | **DamageCalculator** | ダメージ計算（物理/魔法/真ダメージ） |
 | **ActionResolver** | 行動ソート・不発判定・順次解決 |
+| **EffectResolver** | EffectSpec のディスパッチ・Composite/Conditional の再帰解決 |
 | **TriggerSystem** | トリガー条件判定・割り込み処理 |
 | **SummonManager** | 召喚の生成/消滅/上書き/バースト変化 |
 | **BurstManager** | バーストゲージ管理・バースト状態の適用/解除 |
@@ -79,7 +86,11 @@ C# 実装の全体像を定義する。
 ### 依存関係
 
 ```
-GameManager → TurnProcessor → ActionResolver → DamageCalculator
+GameManager → TurnProcessor → ActionResolver → EffectResolver → DamageCalculator
+                                                               → StatusEffectProcessor
+                                                               → DeckManager
+                                                               → SummonManager
+                                                               → BurstManager
                                              → StatCalculator
                                              → TriggerSystem
                             → DeckManager
@@ -362,9 +373,9 @@ EventQueue に Enqueue
    │     - AP 消費                            │
    │     - エレメント消費（elementCost）       │
    │ 4c. エレメント獲得（有色カード→その色+1）│
-   │ 4d. 効果解決                            │
-   │     - DamageCalculator / StatCalculator  │
-   │       等を呼び出し                       │
+   │ 4d. 効果解決（EffectResolver）            │
+   │     - EffectSpec を EffectResolver へ    │
+   │       渡し、各モジュールへ委譲           │
    │ 4e. カード処理                          │
    │     - hand → graveyard                   │
    │ 4f. ActionResolved(executed) 発行        │
@@ -511,6 +522,114 @@ statusHitRate = clamp(baseRate + (attackerTech - defenderTech) * 0.001, 0.10, 0.
 5. floor で整数化
 6. max(1, ...) で最低保証
 7. DamageDealt イベント発行
+```
+
+---
+
+## 6.5. カード効果解決（EffectResolver）
+
+### 責務
+
+`EffectSpec`（`07_data_model.md`）をデータ駆動で解決するモジュール。
+ActionResolver の「4d. 効果解決」ステップから呼び出され、EffectType に応じて既存モジュールへ処理を委譲する。
+
+### 設計原則
+
+- EffectResolver 自身は **ディスパッチャ** であり、実際の計算ロジックは持たない
+- 各 EffectType → 既存モジュール（DamageCalculator, StatusEffectProcessor 等）へ委譲
+- `Composite` は再帰的に子効果を解決、`Conditional` は条件を評価して分岐
+
+### EffectContext（発動元情報）
+
+効果解決時に必要なコンテキスト情報を保持する。
+
+- `sourceTeamId`: string（発動元チーム）
+- `sourceCharacterId`: string（発動元キャラ）
+- `sourceCardId`: string（発動元カード）
+- `sourceType`: `"skill" | "support" | "unique" | "summon" | "item" | "passive" | "setEffect"`
+- `activationMode`: `"normal" | "interrupt"`
+- `parentTarget?`: TargetSpec（親効果から継承された対象。Composite/Conditional 内のサブ効果用）
+
+### EffectType → モジュール ディスパッチ対応表
+
+| EffectType | 委譲先モジュール | 主な処理 |
+|---|---|---|
+| `Damage` | **DamageCalculator** | ダメージ種別判定 → ATK/DEF 取得 → 基本式 → クリティカル → DamageDealt イベント |
+| `Heal` | **EffectResolver 内部** | calcMode に応じて回復量算出 → HP 加算 → Healed イベント |
+| `Draw` | **DeckManager** | DrawCards(count) |
+| `StatusApply` | **StatusEffectProcessor** | ApplyStatus(statusId, duration, ...) |
+| `Dispel` | **StatusEffectProcessor** | DispelStatus(category, count, filterTags) |
+| `Summon` | **SummonManager** | CreateSummon(summonCardId) |
+| `ElementGain` | **EffectResolver 内部** | ElementCounters の該当色を加算 → ElementGained イベント |
+| `ElementConsume` | **EffectResolver 内部** | ElementCounters の該当色を減算 → ElementConsumed イベント |
+| `ElementConvert` | **EffectResolver 内部** | from を減算 → to を加算 → イベント発行 |
+| `BurstGain` | **BurstManager** | AddBurstPoints(points) |
+| `Shield` | **EffectResolver 内部** | シールド量算出 → 対象にシールド付与 → イベント発行 |
+| `Resurrect` | **EffectResolver 内部** | ダウン状態解除 → HP を maxHp × hpPercent で設定 → イベント発行 |
+| `FieldEffectDeploy` | **EffectResolver 内部** | FieldEffectInstance 生成 → TeamState.fieldEffect に配置 → イベント発行 |
+| `ItemSet` | **EffectResolver 内部** | ItemInstance 生成 → キャラにセット（既存上書き） → イベント発行 |
+| `APModify` | **EffectResolver 内部** | AP 増減 → clamp(0, unlockedMaxAP) → イベント発行 |
+| `Composite` | **再帰呼び出し** | children を順次 ResolveEffect() |
+| `Conditional` | **条件評価 → 再帰** | ConditionSpec を評価 → thenEffect or elseEffect を ResolveEffect() |
+
+### Target 継承ルール
+
+サブ効果（Composite の子要素 / Conditional の then/else）の対象指定:
+
+1. サブ効果自身が `target` を持つ場合 → **そちらを使用**
+2. サブ効果の `target` が null の場合 → **親効果の target を継承**
+3. 親効果も target が null の場合 → **EffectContext.parentTarget** を参照
+4. すべて null の場合 → **発動元カードの TargetSpec** を使用
+
+### Composite の解決フロー
+
+```
+ResolveComposite(state, compositeSpec, context):
+  1. children を先頭から順に取得
+  2. 各 child について:
+     a. child.target が null なら parentTarget を設定
+     b. ResolveEffect(state, child, context) を再帰呼び出し
+     c. 結果を state に反映
+  3. 全 children 解決後に return
+```
+
+- 子効果は **記述順（配列順）** で解決される
+- 途中で対象がダウンしても、残りの子効果は **スキップせず** 続行する（対象不在の効果は個別に無効化）
+
+### Conditional の解決フロー
+
+```
+ResolveConditional(state, conditionalSpec, context):
+  1. EvaluateCondition(state, conditionalSpec.condition, context) を呼び出し
+  2. 結果が true:
+     a. thenEffect を ResolveEffect(state, thenEffect, context)
+  3. 結果が false:
+     a. elseEffect が null でなければ ResolveEffect(state, elseEffect, context)
+     b. elseEffect が null なら何もしない
+```
+
+### 条件評価（EvaluateCondition）
+
+```
+EvaluateCondition(state, conditionSpec, context):
+  conditionType に応じて分岐:
+  - ElementThreshold: キャラの ElementCounters[element] を operator で threshold と比較
+  - HpThreshold: scope に応じて自分 or 対象の (currentHp / maxHp) を比較
+  - StatusCheck: scope に応じて自分 or 対象の Statuses を statusId/tags で検索
+  - BurstCheck: scope に応じて自分 or 対象の BurstState.IsBurst を判定
+  - AllyDownCount: チームの IsDown==true のキャラ数を比較
+  - HandCount: チームの Hand.Count を比較
+```
+
+### セット効果（SetEffects）の解決
+
+セット効果は MatchSetup フェイズで解決される（`16_rule_engine_design.md` セクション2 参照）。
+
+```
+ResolveSetEffects(state, setEffects, context):
+  1. 各 EffectSpec について EffectType の制約チェック（許可リストに含まれるか）
+  2. 制約違反の場合はエラーログを出力してスキップ
+  3. 許可された EffectSpec を ResolveEffect() で解決
 ```
 
 ---
@@ -1360,6 +1479,13 @@ public class SupportCardDefinition : CardDefinition
     public EffectSpec Effect { get; set; }
 }
 
+public class ItemCardDefinition : CardDefinition
+{
+    public int Count { get; set; }
+    public List<CardTrigger> Triggers { get; set; }
+    public EffectSpec Effect { get; set; }
+}
+
 public class UniqueCardDefinition : CardDefinition
 {
     public int CooldownTurns { get; set; }
@@ -1594,6 +1720,312 @@ public class RegulationDefinition
     public int ActionChargePoints { get; set; }
     public float DefenseCoefficient { get; set; }
     public string VictoryCondition { get; set; }
+}
+```
+
+### EffectSpec 関連
+
+#### EffectSpec / EffectType
+
+```csharp
+public enum EffectType
+{
+    Damage,
+    Heal,
+    Draw,
+    StatusApply,
+    Dispel,
+    Summon,
+    ElementGain,
+    ElementConsume,
+    ElementConvert,
+    BurstGain,
+    Shield,
+    Resurrect,
+    FieldEffectDeploy,
+    ItemSet,
+    APModify,
+    Composite,
+    Conditional
+}
+
+public class EffectSpec
+{
+    public EffectType EffectType { get; set; }
+    public TargetSpec Target { get; set; }  // nullable — null なら親/カードの target を継承
+
+    // 型別パラメータ（EffectType に応じていずれか1つを使用）
+    public DamageEffectParams DamageParams { get; set; }
+    public HealEffectParams HealParams { get; set; }
+    public DrawEffectParams DrawParams { get; set; }
+    public StatusApplyEffectParams StatusApplyParams { get; set; }
+    public DispelEffectParams DispelParams { get; set; }
+    public SummonEffectParams SummonParams { get; set; }
+    public ElementGainEffectParams ElementGainParams { get; set; }
+    public ElementConsumeEffectParams ElementConsumeParams { get; set; }
+    public ElementConvertEffectParams ElementConvertParams { get; set; }
+    public BurstGainEffectParams BurstGainParams { get; set; }
+    public ShieldEffectParams ShieldParams { get; set; }
+    public ResurrectEffectParams ResurrectParams { get; set; }
+    public FieldEffectDeployEffectParams FieldEffectDeployParams { get; set; }
+    public ItemSetEffectParams ItemSetParams { get; set; }
+    public APModifyEffectParams APModifyParams { get; set; }
+    public CompositeEffectParams CompositeParams { get; set; }
+    public ConditionalEffectParams ConditionalParams { get; set; }
+}
+```
+
+#### 型別パラメータクラス
+
+```csharp
+public class DamageEffectParams
+{
+    public DamageType DamageType { get; set; }
+    public float CardMultiplier { get; set; }
+    public int? FixedDamage { get; set; }
+    public int HitCount { get; set; } = 1;
+    public StatType? AtkStat { get; set; }
+}
+
+public class HealEffectParams
+{
+    public HealCalcMode CalcMode { get; set; }
+    public float Value { get; set; }
+    public StatType? Stat { get; set; }
+}
+
+public enum HealCalcMode { Fixed, MaxHpPercent, StatScale }
+
+public class DrawEffectParams
+{
+    public int Count { get; set; }
+}
+
+public class StatusApplyEffectParams
+{
+    public string StatusId { get; set; }
+    public int? Duration { get; set; }
+    public float? OverrideValue { get; set; }
+    public int Stacks { get; set; } = 1;
+}
+
+public class DispelEffectParams
+{
+    public string Category { get; set; }  // "buff" / "debuff" / "any"
+    public int Count { get; set; }
+    public List<string> FilterTags { get; set; }
+}
+
+public class SummonEffectParams
+{
+    public string SummonCardId { get; set; }
+}
+
+public class ElementGainEffectParams
+{
+    public string Element { get; set; }
+    public int Amount { get; set; }
+}
+
+public class ElementConsumeEffectParams
+{
+    public string Element { get; set; }
+    public int Amount { get; set; }
+}
+
+public class ElementConvertEffectParams
+{
+    public string From { get; set; }
+    public string To { get; set; }
+    public int Amount { get; set; }
+}
+
+public class BurstGainEffectParams
+{
+    public int Points { get; set; }
+}
+
+public class ShieldEffectParams
+{
+    public ShieldCalcMode ShieldType { get; set; }
+    public float Value { get; set; }
+    public int Duration { get; set; } = 1;
+    public StatType? Stat { get; set; }
+}
+
+public enum ShieldCalcMode { Fixed, MaxHpPercent, StatScale }
+
+public class ResurrectEffectParams
+{
+    public float HpPercent { get; set; }
+}
+
+public class FieldEffectDeployEffectParams
+{
+    public string FieldEffectId { get; set; }
+    public int DurationTurns { get; set; }
+}
+
+public class ItemSetEffectParams
+{
+    public string ItemCardId { get; set; }
+}
+
+public class APModifyEffectParams
+{
+    public int Amount { get; set; }
+    public APTargetStat TargetStat { get; set; }
+}
+
+public enum APTargetStat { Current, UnlockedMax }
+
+public class CompositeEffectParams
+{
+    public List<EffectSpec> Children { get; set; }
+}
+
+public class ConditionalEffectParams
+{
+    public ConditionSpec Condition { get; set; }
+    public EffectSpec ThenEffect { get; set; }
+    public EffectSpec ElseEffect { get; set; }  // nullable
+}
+```
+
+#### ConditionSpec
+
+```csharp
+public enum ConditionType
+{
+    ElementThreshold,
+    HpThreshold,
+    StatusCheck,
+    BurstCheck,
+    AllyDownCount,
+    HandCount
+}
+
+public class ConditionSpec
+{
+    public ConditionType ConditionType { get; set; }
+
+    public ElementThresholdParams ElementThresholdParams { get; set; }
+    public HpThresholdParams HpThresholdParams { get; set; }
+    public StatusCheckParams StatusCheckParams { get; set; }
+    public BurstCheckParams BurstCheckParams { get; set; }
+    public AllyDownCountParams AllyDownCountParams { get; set; }
+    public HandCountParams HandCountParams { get; set; }
+}
+
+public class ElementThresholdParams
+{
+    public string Element { get; set; }
+    public ComparisonOp Operator { get; set; }
+    public int Threshold { get; set; }
+}
+
+public class HpThresholdParams
+{
+    public ConditionScope Scope { get; set; }
+    public ComparisonOp Operator { get; set; }
+    public float ThresholdPercent { get; set; }
+}
+
+public class StatusCheckParams
+{
+    public ConditionScope Scope { get; set; }
+    public string StatusId { get; set; }
+    public List<string> FilterTags { get; set; }
+    public bool Exists { get; set; }
+}
+
+public class BurstCheckParams
+{
+    public ConditionScope Scope { get; set; }
+    public bool IsBurst { get; set; }
+}
+
+public class AllyDownCountParams
+{
+    public ComparisonOp Operator { get; set; }
+    public int Count { get; set; }
+}
+
+public class HandCountParams
+{
+    public ComparisonOp Operator { get; set; }
+    public int Count { get; set; }
+}
+
+public enum ComparisonOp { Gte, Lte, Eq }
+public enum ConditionScope { Self, Target }
+```
+
+#### IEffectResolver / EffectResolver
+
+```csharp
+public class EffectContext
+{
+    public string SourceTeamId { get; set; }
+    public string SourceCharacterId { get; set; }
+    public string SourceCardId { get; set; }
+    public string SourceType { get; set; }  // "skill" / "support" / "unique" / etc.
+    public ActivationMode ActivationMode { get; set; }
+    public TargetSpec ParentTarget { get; set; }  // Composite/Conditional 内のサブ効果用
+}
+
+public interface IEffectResolver
+{
+    /// <summary>EffectSpec を解決する</summary>
+    GameState ResolveEffect(GameState state, EffectSpec effect, EffectContext context);
+
+    /// <summary>条件を評価する</summary>
+    bool EvaluateCondition(GameState state, ConditionSpec condition, EffectContext context);
+}
+
+public class EffectResolver : IEffectResolver
+{
+    private readonly IDamageCalculator damageCalculator;
+    private readonly IStatusEffectProcessor statusEffectProcessor;
+    private readonly IDeckManager deckManager;
+    private readonly ISummonManager summonManager;
+    private readonly IBurstManager burstManager;
+    private readonly IStatCalculator statCalculator;
+
+    public EffectResolver(
+        IDamageCalculator damageCalculator,
+        IStatusEffectProcessor statusEffectProcessor,
+        IDeckManager deckManager,
+        ISummonManager summonManager,
+        IBurstManager burstManager,
+        IStatCalculator statCalculator)
+    {
+        this.damageCalculator = damageCalculator;
+        this.statusEffectProcessor = statusEffectProcessor;
+        this.deckManager = deckManager;
+        this.summonManager = summonManager;
+        this.burstManager = burstManager;
+        this.statCalculator = statCalculator;
+    }
+
+    public GameState ResolveEffect(GameState state, EffectSpec effect, EffectContext context)
+    {
+        // 1. Target 解決（effect.Target ?? context.ParentTarget）
+        // 2. EffectType に応じてディスパッチ:
+        //    - Damage → damageCalculator.CalculateDamage(...)
+        //    - StatusApply → statusEffectProcessor.ApplyStatus(...)
+        //    - Draw → deckManager.DrawCards(...)
+        //    - Composite → children を順次 ResolveEffect()
+        //    - Conditional → EvaluateCondition() → then/else を ResolveEffect()
+        //    - etc.
+        return state; // placeholder
+    }
+
+    public bool EvaluateCondition(GameState state, ConditionSpec condition, EffectContext context)
+    {
+        // ConditionType に応じて分岐して評価
+        return false; // placeholder
+    }
 }
 ```
 
