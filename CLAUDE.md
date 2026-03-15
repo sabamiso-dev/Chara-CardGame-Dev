@@ -30,7 +30,18 @@
 ### 設計書（`docs/design/`）— 具体的なクラス・メソッド設計
 | ファイル | 内容 |
 |---|---|
-| 16_rule_engine_design.md | ルールエンジン設計（Phase 1 実装の設計図・全22セクション・C#クラス設計含む） |
+| README.md | 設計書一覧・読み方ガイド・仕様書との対応 |
+| 16_architecture_overview.md | アーキテクチャ概要（設計原則・全体構成図・モジュール責務・依存関係） |
+| 17_game_loop_and_phases.md | ゲームループとフェイズ設計（フェイズ遷移・GameManager・AP管理） |
+| 18_event_and_trigger.md | イベントシステムとトリガー判定（EventQueue・TriggerSystem・無限ループ対策） |
+| 19_action_resolver.md | 行動解決パイプライン（ソートキー・不発チェック・解決フロー） |
+| 20_stat_damage_effect.md | ステータス・ダメージ・効果解決（StatCalculator・DamageCalculator・EffectResolver） |
+| 21_summon_and_burst.md | 召喚管理・バーストシステム（SummonManager・BurstManager・召喚ユニット行動） |
+| 22_subsystems.md | サブシステム（DeckManager・StatusEffect・Shield・Item・FieldEffect） |
+| 23_validation_rng_loader.md | バリデーション・乱数・データローダー（LoadoutValidator・RNG・DefinitionLoader） |
+| 24_1v1_passive_misc.md | 1vs1レギュレーション・パッシブ・降参/切断 |
+| 25_csharp_classes.md | C# クラス/インターフェース設計（全データモデル・enum・EffectSpec） |
+| 26_implementation_roadmap.md | Phase 1 実装ロードマップ（Step 1〜7・テスト方針） |
 
 ## 仕様変更ルール
 - 仕様変更時は関連ドキュメントの整合性を同時に取る
