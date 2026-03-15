@@ -5,7 +5,9 @@
 - 3vs3チーム戦 + 1vs1レギュレーション / 同時操作 / バーストシステム
 - やり取りは日本語で行う
 
-## 仕様書の構成
+## ドキュメント構成
+
+### 要件定義書（`docs/requirements/`）— 大まかな設計要件
 | ファイル | 内容 |
 |---|---|
 | 00_overview.md | ゲーム全体の概要・コンセプト |
@@ -24,13 +26,17 @@
 | 13_github_and_claude_workflow.md | GitHub・Claude連携ワークフロー |
 | 14_content_baselines_and_data_workflow.md | コンテンツ基準値・データ投入手順 |
 | 15_damage_formula.md | ダメージ計算式 |
+
+### 設計書（`docs/design/`）— 具体的なクラス・メソッド設計
+| ファイル | 内容 |
+|---|---|
 | 16_rule_engine_design.md | ルールエンジン設計（Phase 1 実装の設計図・全22セクション・C#クラス設計含む） |
 
 ## 仕様変更ルール
 - 仕様変更時は関連ドキュメントの整合性を同時に取る
-- TBDは 09_open_questions.md に集約
-- 疑問・回答は 11_questions_and_proposals.md に集約
-- 新規データ追加は 14_content_baselines_and_data_workflow.md の手順に従う
+- TBDは `docs/requirements/09_open_questions.md` に集約
+- 疑問・回答は `docs/requirements/11_questions_and_proposals.md` に集約
+- 新規データ追加は `docs/requirements/14_content_baselines_and_data_workflow.md` の手順に従う
 
 ## 開発フェーズ
 - Phase 0: 仕様固め（現在）
@@ -41,7 +47,7 @@
 ## コーディング規約（最小・Phase 1以降で拡充）
 - 言語: C# / Unity
 - ルールエンジンは純粋関数に近い形でユニットテスト可能にする
-- イベント駆動アーキテクチャ（06_turn_flow.md / 07_data_model.md 準拠）
+- イベント駆動アーキテクチャ（`docs/requirements/06_turn_flow.md` / `docs/requirements/07_data_model.md` 準拠）
 - 命名: PascalCase（クラス/メソッド）、camelCase（変数/フィールド）
 
 ## Git運用（個人開発）
