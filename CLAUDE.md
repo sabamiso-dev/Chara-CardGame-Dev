@@ -8,6 +8,8 @@
 ## ドキュメント構成
 
 ### 要件定義書（`docs/requirements/`）— 大まかな設計要件
+詳細は [`docs/requirements/CLAUDE.md`](docs/requirements/CLAUDE.md) を参照。
+
 | ファイル | 内容 |
 |---|---|
 | 00_overview.md | ゲーム全体の概要・コンセプト |
@@ -28,6 +30,8 @@
 | 15_damage_formula.md | ダメージ計算式 |
 
 ### 設計書（`docs/design/`）— 具体的なクラス・メソッド設計
+詳細は [`docs/design/CLAUDE.md`](docs/design/CLAUDE.md) および [`docs/design/README.md`](docs/design/README.md) を参照。
+
 | ファイル | 内容 |
 |---|---|
 | README.md | 設計書一覧・読み方ガイド・仕様書との対応 |
@@ -43,23 +47,16 @@
 | 25_csharp_classes.md | C# クラス/インターフェース設計（全データモデル・enum・EffectSpec） |
 | 26_implementation_roadmap.md | Phase 1 実装ロードマップ（Step 1〜7・テスト方針） |
 
-## 仕様変更ルール
-- 仕様変更時は関連ドキュメントの整合性を同時に取る
-- TBDは `docs/requirements/09_open_questions.md` に集約
-- 疑問・回答は `docs/requirements/11_questions_and_proposals.md` に集約
-- 新規データ追加は `docs/requirements/14_content_baselines_and_data_workflow.md` の手順に従う
-
 ## 開発フェーズ
 - Phase 0: 仕様固め（現在）
 - Phase 1: ルールエンジン（UIなし）
 - Phase 2: UIプロトタイプ
 - Phase 3: コンテンツ投入
 
-## コーディング規約（最小・Phase 1以降で拡充）
+## コーディング規約（最小）
 - 言語: C# / Unity
-- ルールエンジンは純粋関数に近い形でユニットテスト可能にする
-- イベント駆動アーキテクチャ（`docs/requirements/06_turn_flow.md` / `docs/requirements/07_data_model.md` 準拠）
 - 命名: PascalCase（クラス/メソッド）、camelCase（変数/フィールド）
+- 詳細は [`docs/design/CLAUDE.md`](docs/design/CLAUDE.md) を参照
 
 ## Git運用（個人開発）
 - 秘密情報（APIキー、トークン、.env等）をコミットしない
