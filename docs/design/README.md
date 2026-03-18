@@ -20,6 +20,7 @@ Phase 1（ルールエンジン実装）の設計図。
 | [24_1v1_passive_misc.md](24_1v1_passive_misc.md) | 1vs1・パッシブ・降参/切断 | 1vs1方式B対応、キャラパッシブシステム、降参/切断/タイムアウト |
 | [25_csharp_classes.md](25_csharp_classes.md) | C# クラス/インターフェース設計 | 全データモデル、インターフェース、enum、EffectSpec関連 |
 | [26_implementation_roadmap.md](26_implementation_roadmap.md) | Phase 1 実装ロードマップ | Step 1〜7 の実装順序、テスト方針 |
+| [27_state_transitions.md](27_state_transitions.md) | 状態遷移と連鎖解決フロー | ダメージ→ダウン連鎖、バースト適用/解除、ターン終了処理順、召喚入れ替え、蘇生、再計算制約 |
 
 ---
 

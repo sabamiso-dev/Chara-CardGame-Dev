@@ -46,6 +46,7 @@
 | 24_1v1_passive_misc.md | 1vs1レギュレーション・パッシブ・降参/切断 |
 | 25_csharp_classes.md | C# クラス/インターフェース設計（全データモデル・enum・EffectSpec） |
 | 26_implementation_roadmap.md | Phase 1 実装ロードマップ（Step 1〜7・テスト方針） |
+| 27_state_transitions.md | 状態遷移と連鎖解決フロー（ダメージ→ダウン連鎖・バースト適用/解除・ターン終了処理順・蘇生） |
 
 ## 開発フェーズ
 - Phase 0: 仕様固め（現在）
