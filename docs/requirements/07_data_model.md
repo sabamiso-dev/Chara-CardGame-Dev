@@ -393,6 +393,12 @@
 | `FieldEffectDeploy` | フィールド効果展開 | フィールドスキル |
 | `ItemSet` | アイテムセット | アイテムカード |
 | `APModify` | AP 増減 | AP回復スキル |
+| `Discard` | 手札捨て（自分/相手） | 荷物整理、偽情報 |
+| `Bounce` | フィールド→手札戻し | 巫術・扇風乱舞 |
+| `DeckManipulate` | デッキ操作（ボトムドロー/発掘/並べ替え） | アクセスダイブ、地層調査 |
+| `DeckSearch` | デッキサーチ→即発動/手札追加 | 相棒コール |
+| `TokenCreate` | 一時カード生成（使用後→追放） | アクセスダイブ、非常への備え |
+| `Reveal` | 手札/デッキの情報公開 | 観測 |
 | `Composite` | 複合効果（子 EffectSpec のリスト） | ダメージ+デバフ |
 | `Conditional` | 条件分岐（条件→Then/Else） | エレメント≥3で追加ダメージ |
 
@@ -479,6 +485,59 @@
 - `amount`: number（正で回復、負で減少）
 - `targetStat`: `"current" | "unlockedMax"`（現在AP or 解放済み最大AP）
 
+#### DiscardEffectParams（Discard）
+- `count`: number（捨てる枚数）
+- `targetScope`: `"self" | "enemy"`（自分の手札 or 相手の手札）
+- `selection`: DiscardSelection（下記 enum）
+- `destination`: `"graveyard" | "banished" | "deckBottom"`（捨て先）
+
+#### DiscardSelection（enum）
+- `random`：ランダムに選択
+- `lowestCost`：コストが最も低いカードから選択（同コスト内はランダム）
+- `highestCost`：コストが最も高いカードから選択（同コスト内はランダム）
+- `ownerChoice`：所有者が選択（Phase 1 ではランダムで代用可）
+
+#### BounceEffectParams（Bounce）
+- `targetType`: `"summonUnit" | "summonObject" | "item" | "fieldEffect" | "any"`（戻す対象の種別。`any` は召喚/アイテムからランダム）
+- `count`: number（戻す数）
+- `selection`: `"random" | "lowestCost" | "highestCost" | "ownerChoice"`
+- `destination`: `"hand" | "deckTop" | "deckBottom"`（戻し先）
+- `filterCostOperator?`: `"lte" | "gte" | "eq"`（コストフィルタ。省略時はフィルタなし）
+- `filterCostValue?`: number（コストフィルタの基準値。`contextRef` で直前の効果結果を参照可能）
+
+#### DeckManipulateEffectParams（DeckManipulate）
+- `action`: DeckManipulateAction（下記 enum）
+- `count`: number（操作枚数）
+- `filterTags?`: string[]（対象カードのタグフィルタ。発掘で「遺物」タグ等）
+- `remainderAction?`: `"deckBottom" | "deckTop" | "graveyard"`（フィルタに一致しなかったカードの行き先。省略時は `deckBottom`）
+
+#### DeckManipulateAction（enum）
+- `drawFromBottom`：デッキの一番下からカードをドロー
+- `excavate`：デッキの上からcount枚を確認し、filterTagsに一致するカードを手札へ。残りは remainderAction へ
+- `peek`：デッキの上からcount枚を確認（手札には加えない。情報取得のみ）
+
+#### DeckSearchEffectParams（DeckSearch）
+- `filterTags?`: string[]（検索対象のタグフィルタ。例：`["バディ"]`）
+- `filterType?`: `"skill" | "summonUnit" | "summonObject" | "item" | "any"`（カード種別フィルタ）
+- `filterCostOperator?`: `"lte" | "gte" | "eq"`（コストフィルタ）
+- `filterCostValue?`: number | `"remainingAP"`（コスト基準値。`"remainingAP"` は発動時の残りAPを参照）
+- `action`: `"addToHand" | "play"`（見つけたカードを手札に加える or 即座に発動）
+- `maxResults?`: number（検索結果の上限。省略時=1）
+- `onNotFound?`: `"fizzle" | "ignore"`（見つからなかった場合。`fizzle` は不発扱い、`ignore` は何も起きない）
+
+#### TokenCreateEffectParams（TokenCreate）
+- `templateCardId?`: string（テンプレートとなるカード定義のID。省略時は動的生成）
+- `color?`: `"red" | "blue" | "green" | "orange" | "yellow" | "purple" | "colorless" | "casterColor"`（トークンの色。`casterColor` は使用キャラの色を継承）
+- `tags`: string[]（トークンに付与するタグ。`["消失"]` など）
+- `count?`: number（生成枚数。省略時=1）
+- `addTo`: `"hand" | "deckTop" | "deckBottom"`（生成先）
+- `vanishOnUse`: boolean（使用後に追放するか。`true` = 【消失】相当）
+
+#### RevealEffectParams（Reveal）
+- `targetScope`: `"enemyHand" | "enemyDeckTop" | "selfDeckTop"`（公開対象）
+- `count?`: number（`deckTop` 系の場合の枚数。`hand` の場合は全枚数）
+- `duration?`: number（公開情報の持続ターン数。省略時=そのターンのみ）
+
 #### CompositeEffectParams（Composite）
 - `children`: EffectSpec[]（子効果のリスト。順次解決）
 
@@ -547,7 +606,7 @@
 | `Conditional` | 条件付きセット効果（例：特定色デッキの場合のみ発動） |
 
 #### 禁止される EffectType
-- `Damage`, `Heal`, `Dispel`, `Summon`, `ElementConsume`, `ElementConvert`, `Shield`, `Resurrect`, `FieldEffectDeploy`, `ItemSet`
+- `Damage`, `Heal`, `Dispel`, `Summon`, `ElementConsume`, `ElementConvert`, `Shield`, `Resurrect`, `FieldEffectDeploy`, `ItemSet`, `Discard`, `Bounce`, `DeckManipulate`, `DeckSearch`, `TokenCreate`, `Reveal`
   - 理由：これらはバトル中の対象指定・リアルタイム効果を前提としており、構築時パッシブとして適用する意味がない。
 
 ---
@@ -581,6 +640,12 @@
 - `ItemExhausted`（アイテムの残回数が0になり破棄された）
 - `ItemOverwritten`（アイテムが上書きで除去された）
 - `APModified`（AP増減）
+- `CardDiscarded`（手札からカードが捨てられた）
+- `CardBounced`（フィールドのカード/召喚/アイテムが手札に戻された）
+- `DeckManipulated`（デッキ操作が行われた：ボトムドロー/発掘/確認）
+- `DeckSearched`（デッキサーチが行われた）
+- `TokenCreated`（トークンカードが生成された）
+- `HandRevealed`（手札が公開された）
 - `DeckReshuffledFromTrash`（詳細は下記）
 - `ActionResolved`（詳細は下記）
 - `StatRecomputed`（詳細は下記。セクション5参照）
