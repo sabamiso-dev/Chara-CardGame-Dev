@@ -22,6 +22,7 @@ Phase 1（ルールエンジン実装）の設計図。
 | [26_implementation_roadmap.md](26_implementation_roadmap.md) | Phase 1 実装ロードマップ | Step 1〜7 の実装順序、テスト方針 |
 | [27_state_transitions.md](27_state_transitions.md) | 状態遷移と連鎖解決フロー | ダメージ→ダウン連鎖、バースト適用/解除、ターン終了処理順、蘇生 |
 | [28_error_log_replay.md](28_error_log_replay.md) | エラーハンドリング・ログ・リプレイ | エラー3層分類、公開/内部ログ二層、リプレイデータ、診断機能 |
+| [29_data_model_overview.md](29_data_model_overview.md) | データモデル全体マップ | エンティティ関係図、定義/インスタンス一覧、EffectType体系、ゾーン管理、イベント一覧 |
 
 ---
 
